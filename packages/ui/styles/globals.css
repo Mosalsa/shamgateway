@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================
+   Arabisch-freundliches Farbthema
+   ============================ */
+
+:root {
+  --color-primary: 210 90% 45%;
+  --color-secondary: 270 70% 50%;
+  --color-accent: 39 100% 55%;
+  --color-neutral: 0 0% 40%;
+  --color-base: 0 0% 100%;
+  --color-surface: 0 0% 98%;
+  --color-background: 0 0% 100%;
+}
+
+.dark {
+  --color-primary: 210 100% 65%;
+  --color-secondary: 270 100% 75%;
+  --color-accent: 39 100% 60%;
+  --color-neutral: 0 0% 85%;
+  --color-base: 0 0% 10%;
+  --color-surface: 0 0% 15%;
+  --color-background: 0 0% 8%;
+}
+
+/* ============================
+   Basislayout
+   ============================ */
+
+body {
+  @apply font-sans bg-background text-neutral antialiased;
+  direction: rtl; /* kannst später dynamisch setzen für i18n */
+}

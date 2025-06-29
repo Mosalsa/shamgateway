@@ -1,0 +1,21 @@
+# node / pnpm
+node_modules
+pnpm-lock.yaml
+.pnpm-debug.log*
+
+# dist / builds
+dist
+build
+.next
+.turbo
+generated
+
+# dotenv
+.env
+.env.* 
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode/
