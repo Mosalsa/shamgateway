@@ -15,6 +15,8 @@ import { LoginDto } from "./dto/login.dto";
 import { ChangePasswordDto } from "./dto/change-password.dto";
 import { JwtAuthGuard } from "../common/guards/jwt-auth.guard";
 import { JwtService } from "@nestjs/jwt";
+import { RequestResetDto } from "./dto/request-reset.dto";
+import { ResetPasswordDto } from "./dto/reset-password.dto";
 
 @Controller("auth")
 export class AuthController {
@@ -57,5 +59,14 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   logout(@Req() req: Request & { user: any }) {
     return this.authService.logout(req.user.id);
+  }
+  @Post("request-reset")
+  requestReset(@Body() dto: RequestResetDto) {
+    return this.authService.requestPasswordReset(dto);
+  }
+
+  @Post("reset-password")
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto);
   }
 }

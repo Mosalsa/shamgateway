@@ -12,6 +12,9 @@ import { LoginDto } from "./dto/login.dto";
 import { ChangePasswordDto } from "./dto/change-password.dto";
 import { UserRole } from "@prisma/client";
 import { randomBytes } from "crypto";
+import { addHours, isBefore } from "date-fns";
+import { RequestResetDto } from "./dto/request-reset.dto";
+import { ResetPasswordDto } from "./dto/reset-password.dto";
 
 @Injectable()
 export class AuthService {
@@ -146,5 +149,63 @@ export class AuthService {
     });
 
     return { message: "Logged out successfully" };
+  }
+
+  /* ---------- ❶ Reset-Token anfordern ---------- */
+  async requestPasswordReset(dto: RequestResetDto) {
+    // 🌐 Suche User (aber antworte immer gleich, um Enumeration zu verhindern)
+    const user = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+
+    if (user && user.isVerified) {
+      const token = randomBytes(32).toString("hex");
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          resetPasswordToken: token,
+          resetPasswordExpires: addHours(new Date(), 1), // 1 h gültig
+        },
+      });
+
+      // TODO: Mail verschicken – hier nur Placeholder
+      console.log(
+        `📧 Reset-Link: http://localhost:3000/auth/reset-password?token=${token}`
+      );
+    }
+
+    return {
+      message:
+        "If an account exists for that email, a reset link has been sent.",
+    };
+  }
+
+  /* ---------- ❷ Neues Passwort setzen ---------- */
+  async resetPassword(dto: ResetPasswordDto) {
+    const user = await this.prisma.user.findFirst({
+      where: { resetPasswordToken: dto.token },
+    });
+
+    if (
+      !user ||
+      !user.resetPasswordExpires ||
+      isBefore(user.resetPasswordExpires, new Date())
+    ) {
+      throw new UnauthorizedException("Invalid or expired reset token");
+    }
+
+    const hashed = await bcrypt.hash(dto.newPwd, 10);
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: hashed,
+        resetPasswordToken: null,
+        resetPasswordExpires: null,
+        refreshToken: null, // alle Sessions invalidieren
+      },
+    });
+
+    return { message: "Password has been reset successfully" };
   }
 }
