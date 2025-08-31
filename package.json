@@ -9,5 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "packageManager": "pnpm@10.12.4"
+  "packageManager": "pnpm@10.12.4",
+  "dependencies": {
+    "@nestjs/axios": "^4.0.1",
+    "rxjs": "^7.8.2"
+  }
 }

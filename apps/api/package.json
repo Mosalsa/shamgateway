@@ -29,7 +29,6 @@
     "express": "^5.1.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
-    "prisma": "^6.10.1",
     "reflect-metadata": "~0.2.2"
   },
   "devDependencies": {
@@ -42,6 +41,7 @@
     "@types/passport-jwt": "^4.0.1",
     "@types/supertest": "^6.0.3",
     "jest": "^30.0.3",
+    "prisma": "^6.10.1",
     "supertest": "^7.1.1",
     "ts-jest": "^29.4.0",
     "typescript": "^5.8.3"

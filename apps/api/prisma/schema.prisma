@@ -1,3 +1,4 @@
+// apps/api/prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,12 +8,22 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+
+
+// (Optional: falls ungenutzt, später entfernen)
 enum Role {
   USER
-  STAFF      // Angestellter
+  STAFF
   MANAGER
   ADMIN
 }
+// Wer verarbeitet die Zahlung?
+enum PaymentProvider {
+  STRIPE
+  DUFFEL
+  OTHER
+}
+
 
 enum UserRole {
   CUSTOMER
@@ -21,19 +32,84 @@ enum UserRole {
 }
 
 model User {
-  id         String    @id @default(uuid())
-  email      String    @unique
-  password   String
-  firstName  String?
-  lastName   String?
-  birthDate  DateTime?
-  role       UserRole  @default(CUSTOMER)
-  isVerified     Boolean  @default(false)
-  verificationToken String?
-  refreshToken   String?
-  resetPasswordToken     String?   // Einmaliger Reset-Token
-  resetPasswordExpires   DateTime? // Ablaufdatum (z. B. 1h)
-  createdAt  DateTime  @default(now())
-  updatedAt  DateTime  @updatedAt
- 
+  id                   String    @id @default(uuid())
+  email                String    @unique
+  password             String
+  firstName            String?
+  lastName             String?
+  birthDate            DateTime?
+  role                 UserRole  @default(CUSTOMER)
+  isVerified           Boolean   @default(false)
+  verificationToken    String?
+  refreshToken         String?
+  resetPasswordToken   String?
+  resetPasswordExpires DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  orders Order[]
+
+  @@index([email])
+}
+
+model Order {
+  id       String  @id @default(cuid())
+  duffelId String  @unique
+  offerId  String
+  userId   String
+  status   String?
+  amount   String
+  currency String
+  owner    String?
+  liveMode Boolean @default(false)
+  paymentProvider   PaymentProvider? // STRIPE | DUFFEL | OTHER
+  paymentIntentId   String? @unique  // Stripe PI oder Duffel Payment-Ref
+  paymentStatus     String?          // freie Zeichenkette ("succeeded", "awaiting_payment", ...)
+  paidAt            DateTime?        // Duffel: payment_status.paid_at
+  awaitingPayment   Boolean?         // Duffel: payment_status.awaiting_payment
+  paymentRequiredBy DateTime?        // Duffel: payment_status.payment_required_by
+  priceGuaranteeExpiresAt DateTime?  // Duffel: payment_status.price_guarantee_expires_at
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  refunds           Refund[]
+  OrderCancellation OrderCancellation[]
+
+  @@index([userId])
+  @@index([duffelId])
+  @@index([offerId])
+  @@index([paymentIntentId])
+}
+
+model OrderCancellation {
+  id                   String    @id @default(cuid())
+  duffelCancellationId String    @unique
+  orderDuffelId        String 
+  refundAmount         String? 
+  refundCurrency       String? 
+  refundTo             String? 
+  expiresAt            DateTime?
+  confirmedAt          DateTime?
+  liveMode             Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order Order @relation(fields: [orderDuffelId], references: [duffelId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([orderDuffelId])
+}
+
+model Refund {
+  id        String   @id @default(cuid())
+  duffelId  String   @unique
+  orderId   String
+  amount    String
+  currency  String
+  status    String
+  createdAt DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 }
