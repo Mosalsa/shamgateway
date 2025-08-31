@@ -52,8 +52,8 @@ export class OrdersController {
   }
 
   @UseGuards(JwtAuthGuard)
-  @Post(":cancellationId/cancel/confirm")
-  async confirm(
+  @Post("cancellations/:cancellationId/confirm")
+  confirmCancel(
     @Param("cancellationId") cancellationId: string,
     @Req() req: any
   ) {
