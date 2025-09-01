@@ -8,19 +8,19 @@ async function bootstrap() {
 
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true, // ❗ löscht unbekannte Felder
-      forbidNonWhitelisted: true, // (Optional) gibt sogar 400 Fehler zurück
+      whitelist: true,
+      forbidNonWhitelisted: true,
       transform: true,
     })
   );
 
-  // Stripe Webhook braucht rawBody (nur für diesen Endpoint!)
+  // ✅ GENAU der Webhook-Pfad + roher Body NUR für diese Route
   app.use(
-    "/payments/webhook",
-    express.raw({ type: "application/json" }) // <- hier kein JSON-Parsing
+    "/payments/webhook/stripe",
+    express.raw({ type: "*/*" }) // oder "application/json" – wichtig ist: raw, nicht json()
   );
 
-  // Für alle anderen Endpoints weiterhin normales JSON-Parsing
+  // danach für alle anderen Routen normal parsen
   app.use(express.json());
 
   await app.listen(3000);

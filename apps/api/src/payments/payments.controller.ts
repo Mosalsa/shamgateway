@@ -5,10 +5,13 @@ import {
   HttpCode,
   Param,
   Post,
-  Headers,
   UsePipes,
   ValidationPipe,
+  Req,
+  BadRequestException,
+  Headers,
 } from "@nestjs/common";
+import type { Request } from "express";
 import { PaymentsService } from "./payments.service";
 import { CreateIntentDto } from "./dto/create-intent.dto";
 
@@ -30,13 +33,20 @@ export class PaymentsController {
   @Post("webhook/stripe")
   @HttpCode(200)
   async stripeWebhook(
-    @Body() raw: Buffer,
-    @Headers("stripe-signature") signature?: string
+    @Req() req: Request,
+    @Headers("stripe-signature") sig?: string | string[]
   ) {
-    // raw-Body kommt durch Middleware als Buffer
-    return this.payments.handleWebhook(
-      raw as unknown as Buffer,
-      signature ?? ""
-    );
+    // express.raw() setzt den Body unter req.body (Buffer)
+    const raw =
+      (req as any).rawBody ?? // falls du irgendwo rawBody setzt
+      (req as any).body; // <- Buffer von express.raw()
+
+    if (!raw || !(raw instanceof Buffer)) {
+      throw new BadRequestException(
+        "Missing raw Buffer body. Ensure express.raw({ type: '*/*' }) is bound to /payments/webhook/stripe BEFORE express.json()."
+      );
+    }
+    const signature = Array.isArray(sig) ? sig[0] : sig;
+    return this.payments.handleWebhook(raw, signature ?? "");
   }
 }
