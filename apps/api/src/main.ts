@@ -20,6 +20,11 @@ async function bootstrap() {
     express.raw({ type: "*/*" }) // oder "application/json" – wichtig ist: raw, nicht json()
   );
 
+  app.use(
+    "/webhooks/duffel",
+    express.raw({ type: "application/json" }) // ✅ NEU: Duffel braucht den unveränderten Body
+  );
+
   // danach für alle anderen Routen normal parsen
   app.use(express.json());
 

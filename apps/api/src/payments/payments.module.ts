@@ -4,9 +4,10 @@ import { raw } from "body-parser";
 import { PaymentsController } from "./payments.controller";
 import { PaymentsService } from "./payments.service";
 import { DuffelModule } from "../duffel/duffel.module";
+import { BullModule } from "@nestjs/bullmq";
 
 @Module({
-  imports: [DuffelModule],
+  imports: [DuffelModule, BullModule.registerQueue({ name: "eticket-poll" })],
   controllers: [PaymentsController],
   providers: [PaymentsService],
 })

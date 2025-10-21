@@ -54,4 +54,49 @@ export class DuffelService {
       );
     }
   }
+  // apps/api/src/duffel/duffel.service.ts
+
+  // --- Order Cancellation: create quote ---
+  async createOrderCancellation(input: { order_id: string; reason?: string }) {
+    try {
+      const { data } = await firstValueFrom(
+        this.http.post(`/order_cancellations`, { data: input })
+      );
+      return data?.data ?? data;
+    } catch (e: any) {
+      const msg = e?.response?.data ?? e?.message ?? "unknown";
+      throw new BadRequestException(`Duffel cancellation quote failed: ${msg}`);
+    }
+  }
+
+  // --- Order Cancellation: confirm ---
+  async confirmOrderCancellation(cancellationId: string) {
+    try {
+      const { data } = await firstValueFrom(
+        this.http.post(
+          `/order_cancellations/${cancellationId}/actions/confirm`,
+          { data: {} }
+        )
+      );
+      return data?.data ?? data;
+    } catch (e: any) {
+      const msg = e?.response?.data ?? e?.message ?? "unknown";
+      throw new BadRequestException(
+        `Duffel cancellation confirm failed: ${msg}`
+      );
+    }
+  }
+
+  // (optional) Order Cancellation: get one
+  async getOrderCancellation(cancellationId: string) {
+    try {
+      const { data } = await firstValueFrom(
+        this.http.get(`/order_cancellations/${cancellationId}`)
+      );
+      return data?.data ?? data;
+    } catch (e: any) {
+      const msg = e?.response?.data ?? e?.message ?? "unknown";
+      throw new BadRequestException(`Duffel cancellation fetch failed: ${msg}`);
+    }
+  }
 }

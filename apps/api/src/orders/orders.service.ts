@@ -195,4 +195,143 @@ export class OrdersService {
       "Use /orders/:id/cancel (quote) then confirm to refund if refundable."
     );
   }
+
+  // ---- Cancellation: get one by id ----
+  async getCancellation(cancellationId: string) {
+    try {
+      const { data } = await firstValueFrom(
+        this.http.get(`/order_cancellations/${cancellationId}`)
+      );
+      return data?.data ?? data;
+    } catch (err: any) {
+      throw new HttpException(
+        err?.response?.data ?? err?.message ?? "Unknown error",
+        err?.response?.status ?? 500
+      );
+    }
+  }
+
+  // ---- List Duffel orders (optional helper; nicht deine DB, sondern /air/orders) ----
+  async listDuffelOrders(query?: { after?: string; limit?: number }) {
+    try {
+      const { data } = await firstValueFrom(
+        this.http.get(`/orders`, { params: query ?? {} })
+      );
+      // Wichtig: Meta/Links können für Pagination nötig sein;
+      // falls du nur "data" willst, kannst du hier auch "data?.data ?? data" zurückgeben.
+      return data;
+    } catch (err: any) {
+      throw new HttpException(
+        err?.response?.data ?? err?.message ?? "Unknown error",
+        err?.response?.status ?? 500
+      );
+    }
+  }
+
+  //
+  async persistTicketDocuments(duffelOrderId: string, docs: any[]) {
+    const eDocs = (docs ?? []).filter((d) => d?.type === "electronic_ticket");
+    if (!eDocs.length) return 0;
+
+    for (const d of eDocs) {
+      await this.prisma.ticketDocument.upsert({
+        where: { id: d.id ?? `${duffelOrderId}:${d.unique_identifier}` }, // oder cuid in create
+        update: {
+          type: d.type ?? "electronic_ticket",
+          uniqueId: d.unique_identifier ?? null,
+          url: d.url ?? null,
+        },
+        create: {
+          id: d.id ?? undefined,
+          orderId: (
+            await this.prisma.order.findUnique({
+              where: { duffelId: duffelOrderId },
+              select: { id: true },
+            })
+          )?.id!,
+          type: d.type ?? "electronic_ticket",
+          uniqueId: d.unique_identifier ?? null,
+          url: d.url ?? null,
+        },
+      });
+    }
+
+    await this.prisma.order
+      .update({
+        where: { duffelId: duffelOrderId },
+        data: {
+          status: "confirmed",
+          /* falls im Schema vorhanden: */ eticketReady: true as any,
+        },
+      })
+      .catch(() => {});
+
+    return eDocs.length;
+  }
+
+  async persistAirlineChange(duffelOrderId: string, payload: any) {
+    await this.prisma.orderScheduleChange.create({
+      data: {
+        orderId: (
+          await this.prisma.order.findUnique({
+            where: { duffelId: duffelOrderId },
+            select: { id: true },
+          })
+        )?.id!,
+        payload,
+      },
+    });
+    // TODO: Notify User/Backoffice
+  }
+
+  async markCancellation(event: "created" | "confirmed", data: any) {
+    const id = data?.id;
+    if (!id) return;
+    if (event === "created") {
+      await this.prisma.orderCancellation.upsert({
+        where: { duffelCancellationId: id },
+        update: {
+          refundAmount: data.refund_amount ?? null,
+          refundCurrency: data.refund_currency ?? null,
+          refundTo: data.refund_to ?? null,
+          expiresAt: data.expires_at ? new Date(data.expires_at) : null,
+          liveMode: !!data.live_mode,
+        },
+        create: {
+          duffelCancellationId: id,
+          orderDuffelId: data.order_id,
+          refundAmount: data.refund_amount ?? null,
+          refundCurrency: data.refund_currency ?? null,
+          refundTo: data.refund_to ?? null,
+          expiresAt: data.expires_at ? new Date(data.expires_at) : null,
+          liveMode: !!data.live_mode,
+        },
+      });
+    } else {
+      await this.prisma.orderCancellation
+        .update({
+          where: { duffelCancellationId: id },
+          data: {
+            confirmedAt: data.confirmed_at
+              ? new Date(data.confirmed_at)
+              : new Date(),
+          },
+        })
+        .catch(() => {});
+      await this.prisma.order
+        .update({
+          where: { duffelId: data.order_id },
+          data: { status: "cancelled" },
+        })
+        .catch(() => {});
+    }
+  }
+
+  /** Markiert DB-Order als eTicket-bereit (Status optional setzen). */
+  async markEticketReady(duffelOrderId: string, status?: string) {
+    await this.prisma.order.update({
+      where: { duffelId: duffelOrderId },
+      data: { eticketReady: true as any, ...(status ? { status } : {}) },
+    });
+  }
 }

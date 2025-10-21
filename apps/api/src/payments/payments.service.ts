@@ -10,6 +10,8 @@ import Stripe from "stripe";
 import crypto from "crypto";
 import { toMinorUnits, fromMinorUnits } from "./currency.util";
 import { DuffelService } from "../duffel/duffel.service";
+import { InjectQueue } from "@nestjs/bullmq";
+import { Queue } from "bullmq";
 
 const PAYMENTS_DEBUG = process.env.PAYMENTS_DEBUG === "1";
 
@@ -29,7 +31,8 @@ export class PaymentsService {
 
   constructor(
     private readonly cfg: ConfigService,
-    private readonly duffel: DuffelService
+    private readonly duffel: DuffelService,
+    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue
   ) {
     const key = this.cfg.get<string>("STRIPE_SECRET_KEY");
     if (!key) {
@@ -55,6 +58,35 @@ export class PaymentsService {
       this.logger.debug(base);
     }
   }
+  // === Hilfsfunktionen (oben in der Klasse ergänzen) =========================
+  /** Vergleicht zwei Beträge als Strings mit Währungs-Exponent, z.B. "123.40" EUR */
+  private amountsEqual(a: string, b: string, currency: string) {
+    try {
+      const ma = toMinorUnits(a, currency);
+      const mb = toMinorUnits(b, currency);
+      return ma === mb;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Voll-Refund via Duffel: Quote erzeugen & sofort bestätigen */
+  private async refundViaDuffelCancellation(
+    orderId: string,
+    reason = "customer_refund"
+  ) {
+    // Quote holen
+    const quote = await this.duffel.createOrderCancellation({
+      order_id: orderId,
+      reason,
+    });
+    if (!quote?.id)
+      throw new Error(`Duffel cancellation quote failed for order ${orderId}`);
+    // Confirm
+    const confirmed = await this.duffel.confirmOrderCancellation(quote.id);
+    return confirmed;
+  }
+  // ==========================================================================
 
   /** holt (falls nötig) den PI, um z. B. metadata.duffel_order_id zu lesen */
   private async getPaymentIntent(
@@ -192,112 +224,211 @@ export class PaymentsService {
     this.logEvent(event);
 
     switch (event.type) {
+      // apps/api/src/payments/payments.service.ts  (innerhalb switch(event.type))
+
       case "payment_intent.succeeded": {
         const pi = event.data.object as Stripe.PaymentIntent;
         this.logger.log(
           `PI succeeded: ${pi.id} amount=${pi.amount} ${pi.currency}`
         );
-        const orderId = pi.metadata?.duffel_order_id;
 
-        if (orderId) {
-          try {
-            const amountStr = fromMinorUnits(pi.amount, pi.currency);
-            this.logger.log(
-              `Duffel pay: order=${orderId} amount=${amountStr} currency=${pi.currency.toUpperCase()} idem=${
-                pi.id
-              }`
-            );
-            await this.duffel.createPayment({
-              order_id: orderId,
-              amount: amountStr,
-              currency: pi.currency,
-              idempotencyKey: pi.id,
-            });
-            // TODO: DB -> order status "PAID", store pi.id
-          } catch (e) {
-            this.logger.error(
-              `Duffel settlement failed for order ${orderId}: ${e}`
-            );
-            // 500 -> Stripe retried den Webhook; call ist idempotent
-            throw new InternalServerErrorException("Duffel settlement failed");
-          }
-        } else {
+        const orderId = pi.metadata?.duffel_order_id;
+        if (!orderId) {
           this.logger.warn(`PI ${pi.id} without duffel_order_id metadata`);
+          break;
         }
+
+        // Nur HOLD/awaiting Orders bezahlen – instant bitte überspringen
+        const order = await this.duffel.getOrder(orderId);
+        const awaiting =
+          order?.payment_status?.awaiting_payment === true ||
+          order?.type === "hold";
+
+        if (!awaiting) {
+          this.logger.log(
+            `Skip Duffel payment: order ${orderId} is not awaiting payment (type=${order?.type}, awaiting=${order?.payment_status?.awaiting_payment})`
+          );
+          break;
+        }
+
+        const amountStr = fromMinorUnits(pi.amount, pi.currency);
+        const currency = pi.currency.toUpperCase();
+
+        // optional: Plausibilitätscheck gegen Order-Totals
+        try {
+          const oAmt = order?.total_amount;
+          const oCur = (order?.total_currency || "").toUpperCase();
+          if (oAmt && oCur && (oCur !== currency || oAmt !== amountStr)) {
+            this.logger.warn(
+              `Amount/Currency mismatch: PI=${amountStr} ${currency} vs Order=${oAmt} ${oCur}`
+            );
+            // ggf. break; je nach Policy
+          }
+        } catch {}
+
+        try {
+          this.logger.log(
+            `Duffel pay: order=${orderId} amount=${amountStr} currency=${currency} idem=${pi.id}`
+          );
+          await this.duffel.createPayment({
+            order_id: orderId,
+            amount: amountStr,
+            currency, // UPPERCASE
+            idempotencyKey: pi.id, // idempotent via PI-ID
+          });
+          // TODO: DB -> status "PAID", store pi.id
+        } catch (e) {
+          this.logger.error(
+            `Duffel settlement failed for order ${orderId}: ${e}`
+          );
+          throw new InternalServerErrorException("Duffel settlement failed");
+        }
+        await this.duffel.createPayment({
+          order_id: orderId,
+          amount: amountStr,
+          currency,
+          idempotencyKey: pi.id,
+        });
+        await this.eticketQueue.add(
+          "poll",
+          { orderId },
+          { delay: 3000, removeOnComplete: true, removeOnFail: true }
+        );
+
         break;
       }
 
       case "payment_intent.payment_failed": {
         const pi = event.data.object as Stripe.PaymentIntent;
-        this.logger.warn(
-          `PI failed: ${pi.id} ${pi.last_payment_error?.message ?? ""}`
-        );
-        // TODO: DB -> order/payment failed
+        const msg = pi.last_payment_error?.message ?? "";
+        const orderId = pi.metadata?.duffel_order_id;
+
+        this.logger.warn(`PI failed: ${pi.id} ${msg} order=${orderId ?? "-"}`);
+
+        // Duffel: nichts buchen/bezahlen – es ist ja fehlgeschlagen.
+        // Business: DB markieren, User informieren
+        try {
+          // TODO: this.prisma.order.update({ where:{ duffelId: orderId }, data:{ paymentStatus:'failed' }})
+        } catch {}
         break;
       }
 
-      // ---- Refund handling (reines Stripe-Tracking; Duffel-Policy separat) ----
       case "charge.refunded":
       case "refund.updated": {
-        try {
-          // Charge ermitteln
-          let charge: Stripe.Charge | undefined;
-          if (event.type === "charge.refunded") {
-            charge = event.data.object as Stripe.Charge;
+        // Ziel: Stripe-Refunds ↔ Duffel-Konsistenz
+        // full refund -> Duffel Order cancel (Quote + Confirm)
+        // partial refund -> KEIN Auto-Handling (Order Changes/Cancellation policy-spezifisch)
+
+        // 1) Charge + PI ermitteln
+        let charge: Stripe.Charge | undefined;
+        if (event.type === "charge.refunded") {
+          charge = event.data.object as Stripe.Charge;
+        } else {
+          const refund = event.data.object as Stripe.Refund;
+          if (typeof refund.charge === "string") {
+            charge = await this.stripe.charges.retrieve(refund.charge);
           } else {
-            const refund = event.data.object as Stripe.Refund;
-            if (typeof refund.charge === "string") {
-              charge = await this.stripe.charges.retrieve(refund.charge);
-            } else {
-              charge = refund.charge as Stripe.Charge;
-            }
+            charge = refund.charge as Stripe.Charge;
           }
+        }
+        if (!charge) {
+          this.logger.warn(`[refund] no charge in event ${event.id}`);
+          break;
+        }
 
-          if (!charge) {
-            this.logger.warn(`[refund] no charge in event ${event.id}`);
-            break;
-          }
+        const piId =
+          typeof charge.payment_intent === "string"
+            ? charge.payment_intent
+            : (charge.payment_intent as Stripe.PaymentIntent | null)?.id;
 
-          const piId =
-            typeof charge.payment_intent === "string"
-              ? charge.payment_intent
-              : (charge.payment_intent as Stripe.PaymentIntent | null)?.id;
+        if (!piId) {
+          this.logger.warn(
+            `[refund] charge ${charge.id} has no payment_intent`
+          );
+          break;
+        }
 
-          if (!piId) {
-            this.logger.warn(
-              `[refund] charge ${charge.id} has no payment_intent`
+        const pi = await this.getPaymentIntent(piId);
+        const orderId = pi?.metadata?.duffel_order_id;
+        if (!orderId) {
+          this.logger.warn(
+            `[refund] PI ${piId} without duffel_order_id; skipping Duffel sync`
+          );
+          break;
+        }
+
+        const currency = (
+          charge.currency ||
+          pi?.currency ||
+          "eur"
+        ).toUpperCase();
+        const refundedMinor = charge.amount_refunded ?? 0;
+        const refunded = fromMinorUnits(refundedMinor, currency);
+
+        // 2) Duffel-Order & Totals
+        const order = await this.duffel.getOrder(orderId);
+        const total = order?.total_amount;
+        const totalCur = (order?.total_currency || "").toUpperCase();
+        if (!total || !totalCur) {
+          this.logger.warn(
+            `[refund] Duffel order ${orderId} has no totals; skipping auto-cancel`
+          );
+          break;
+        }
+
+        // 3) Voll vs. Teil-Refund
+        const amountsEqual = (() => {
+          try {
+            return (
+              toMinorUnits(refunded, currency) ===
+                toMinorUnits(total, totalCur) && currency === totalCur
             );
-            break;
+          } catch {
+            return false;
           }
+        })();
 
-          const pi = await this.getPaymentIntent(piId);
-          const orderId = pi?.metadata?.duffel_order_id;
+        if (!amountsEqual) {
+          // PARTIAL
+          this.logger.warn(
+            `[refund] partial refund: refunded=${refunded} ${currency} vs order=${total} ${totalCur} (order=${orderId}). No automatic Duffel action.`
+          );
+          // TODO: DB -> PARTIALLY_REFUNDED, Ops-Case anlegen
+          break;
+        }
 
-          const refundedMinor = charge.amount_refunded ?? 0;
-          const currency = (
-            charge.currency ??
-            pi?.currency ??
-            "eur"
-          ).toUpperCase();
-          const refunded = fromMinorUnits(refundedMinor, currency);
-
+        // 4) FULL -> Duffel cancel (Quote + Confirm)
+        try {
           this.logger.log(
-            `[refund] PI=${piId} charge=${
-              charge.id
-            } refunded=${refunded} ${currency} order=${orderId ?? "-"}`
+            `[refund] full refund -> cancelling Duffel order ${orderId}`
+          );
+          const quote = await this.duffel.createOrderCancellation({
+            order_id: orderId,
+            reason: "customer_refund",
+          });
+          const confirmed = await this.duffel.confirmOrderCancellation(
+            quote.id
           );
 
-          // TODO: DB:
-          // - full refund => status REFUNDED
-          // - partial refund => status PARTIALLY_REFUNDED
-          // - audit trail (charge/refund ids, amounts)
-          //
-          // ⚠️ Wichtig: Hier **kein** automatisches Duffel-Undo.
-          // Falls gewünscht, eigene Business-Regeln + passende Duffel-APIs nutzen.
+          // Optional: Abgleich der Beträge
+          const dAmt = confirmed?.refund_amount;
+          const dCur = (confirmed?.refund_currency || "").toUpperCase();
+          if (dAmt && dCur && (dCur !== currency || dAmt !== refunded)) {
+            this.logger.warn(
+              `[refund] mismatch Duffel vs Stripe: Duffel=${dAmt} ${dCur} / Stripe=${refunded} ${currency}`
+            );
+          }
+
+          // TODO: DB -> REFUNDED, speichern cancellation id / charge / refund ids
         } catch (err: any) {
-          this.logger.error(`[refund] handler error: ${err?.message ?? err}`);
-          // kein throw -> Refund-Events nicht retryen lassen
+          this.logger.error(
+            `[refund] Duffel cancellation failed for order ${orderId}: ${
+              err?.message ?? err
+            }`
+          );
+          // kein throw -> Stripe soll Refund-Webhook nicht retry-blocken
         }
+
         break;
       }
 
