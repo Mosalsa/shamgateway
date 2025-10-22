@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Builds / Bundles
+dist/
+build/
+out/
+coverage/
+*.log
+logs/
+*.tsbuildinfo
+
+# Next.js
+.next/
+
+# Turbo / pnpm
+.turbo/
+.pnpm-debug.log
+
+# Env & Secrets
+.env
+.env.*
+!.env.example
+
+# Caches / Temp
+.tmp/
+.cache/
+.eslintcache
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
