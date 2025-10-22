@@ -58,7 +58,7 @@ export class PaymentsService {
       this.logger.debug(base);
     }
   }
-  // === Hilfsfunktionen (oben in der Klasse ergänzen) =========================
+
   /** Vergleicht zwei Beträge als Strings mit Währungs-Exponent, z.B. "123.40" EUR */
   private amountsEqual(a: string, b: string, currency: string) {
     try {
@@ -283,12 +283,7 @@ export class PaymentsService {
           );
           throw new InternalServerErrorException("Duffel settlement failed");
         }
-        await this.duffel.createPayment({
-          order_id: orderId,
-          amount: amountStr,
-          currency,
-          idempotencyKey: pi.id,
-        });
+
         await this.eticketQueue.add(
           "poll",
           { orderId },

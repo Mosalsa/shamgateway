@@ -70,7 +70,13 @@ export class EticketPollProcessor extends WorkerHost {
     await job.queue.add(
       "poll",
       { orderId, attempt: attempt + 1 },
-      { delay, removeOnComplete: true, removeOnFail: true }
+
+      {
+        jobId: `poll:${orderId}`,
+        delay,
+        removeOnComplete: true,
+        removeOnFail: true,
+      }
     );
     return true;
   }
