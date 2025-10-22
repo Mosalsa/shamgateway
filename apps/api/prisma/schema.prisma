@@ -1,4 +1,3 @@
-// apps/api/prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -6,27 +5,6 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-}
-
-// (Optional: falls ungenutzt, später entfernen)
-enum Role {
-  USER
-  STAFF
-  MANAGER
-  ADMIN
-}
-
-// Wer verarbeitet die Zahlung?
-enum PaymentProvider {
-  STRIPE
-  DUFFEL
-  OTHER
-}
-
-enum UserRole {
-  CUSTOMER
-  ADMIN
-  STAFF
 }
 
 model User {
@@ -44,45 +22,41 @@ model User {
   resetPasswordExpires DateTime?
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
-
-  orders Order[]
+  orders               Order[]
 
   @@index([email])
 }
 
 model Order {
-  id                      String           @id @default(cuid())
-  duffelId                String           @unique
+  id                      String                @id @default(cuid())
+  duffelId                String                @unique
   offerId                 String
   userId                  String
   status                  String?
   amount                  String
   currency                String
   owner                   String?
-  liveMode                Boolean          @default(false)
-  paymentProvider         PaymentProvider? // STRIPE | DUFFEL | OTHER
-  paymentIntentId         String?          @unique // Stripe PI oder Duffel Payment-Ref
-  paymentStatus           String? // freie Zeichenkette ("succeeded", "awaiting_payment", ...)
-  paidAt                  DateTime? // Duffel: payment_status.paid_at
-  awaitingPayment         Boolean? // Duffel: payment_status.awaiting_payment
-  paymentRequiredBy       DateTime? // Duffel: payment_status.payment_required_by
-  priceGuaranteeExpiresAt DateTime? // Duffel: payment_status.price_guarantee_expires_at
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  refunds           Refund[]
-  OrderCancellation OrderCancellation[]
-
-  lastEventType   String? // z.B. "order.updated"
-  eticketReady    Boolean               @default(false)
-  documents       Json? // komplette documents[] aus Duffel
-  bookingRef      String? // PNR/Record Locator falls geliefert
-  segments        Json? // kompaktes Segment-Array aus der Order
-  passengers      Json? // Passagierdaten, falls du sie syncen willst
-  tickets         TicketDocument[]      @relation("Order_TicketDocuments")
-  scheduleChanges OrderScheduleChange[] @relation("Order_ScheduleChanges")
+  liveMode                Boolean               @default(false)
+  paymentProvider         PaymentProvider?
+  paymentIntentId         String?               @unique
+  paymentStatus           String?
+  paidAt                  DateTime?
+  awaitingPayment         Boolean?
+  paymentRequiredBy       DateTime?
+  priceGuaranteeExpiresAt DateTime?
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+  lastEventType           String?
+  eticketReady            Boolean               @default(false)
+  documents               Json?
+  bookingRef              String?
+  segments                Json?
+  passengers              Json?
+  user                    User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  OrderCancellation       OrderCancellation[]
+  scheduleChanges         OrderScheduleChange[] @relation("Order_ScheduleChanges")
+  refunds                 Refund[]
+  tickets                 TicketDocument[]      @relation("Order_TicketDocuments")
 
   @@index([userId])
   @@index([duffelId])
@@ -100,11 +74,9 @@ model OrderCancellation {
   expiresAt            DateTime?
   confirmedAt          DateTime?
   liveMode             Boolean   @default(false)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  order Order @relation(fields: [orderDuffelId], references: [duffelId], onDelete: Cascade, onUpdate: Cascade)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  order                Order     @relation(fields: [orderDuffelId], references: [duffelId], onDelete: Cascade)
 
   @@index([orderDuffelId])
 }
@@ -117,8 +89,7 @@ model Refund {
   currency  String
   status    String
   createdAt DateTime @default(now())
-
-  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
 }
 
 model WebhookEvent {
@@ -131,8 +102,7 @@ model WebhookEvent {
   createdAtRemote DateTime
   processedAt     DateTime?
   raw             Json
-
-  createdAt DateTime @default(now())
+  createdAt       DateTime  @default(now())
 
   @@index([type])
   @@index([idempotencyKey])
@@ -145,28 +115,45 @@ model ProcessedKey {
 }
 
 model TicketDocument {
-  id      String @id @default(cuid())
-  orderId String
-  order   Order  @relation("Order_TicketDocuments", fields: [orderId], references: [id], onDelete: Cascade)
-
+  id        String   @id @default(cuid())
+  orderId   String
   type      String
-  uniqueId  String   @unique    // <-- hinzufügen
+  uniqueId  String   @unique
   url       String?
   createdAt DateTime @default(now())
+  order     Order    @relation("Order_TicketDocuments", fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId])
 }
 
 model OrderScheduleChange {
-  id      String @id @default(cuid())
-  orderId String
-  order   Order  @relation("Order_ScheduleChanges", fields: [orderId], references: [id], onDelete: Cascade)
-
+  id         String   @id @default(cuid())
+  orderId    String
   detectedAt DateTime @default(now())
   payload    Json
   resolved   Boolean  @default(false)
   note       String?
+  order      Order    @relation("Order_ScheduleChanges", fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId])
   @@index([resolved])
+}
+
+enum Role {
+  USER
+  STAFF
+  MANAGER
+  ADMIN
+}
+
+enum PaymentProvider {
+  STRIPE
+  DUFFEL
+  OTHER
+}
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+  STAFF
 }

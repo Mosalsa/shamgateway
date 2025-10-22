@@ -121,7 +121,7 @@ export class DuffelWebhookService {
     }
 
     await this.queue.add("process", event as any, {
-      jobId: event.id,
+      // jobId: event.id,
       removeOnComplete: 500,
       removeOnFail: 500,
     });
