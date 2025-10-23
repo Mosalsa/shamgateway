@@ -6,6 +6,7 @@ import { PaymentsService } from "./payments.service";
 import { DuffelModule } from "../duffel/duffel.module";
 import { BullModule } from "@nestjs/bullmq";
 import { PrismaModule } from "../../prisma/prisma.module";
+
 @Module({
   imports: [
     DuffelModule,
@@ -14,6 +15,7 @@ import { PrismaModule } from "../../prisma/prisma.module";
   ],
   controllers: [PaymentsController],
   providers: [PaymentsService],
+  exports: [PaymentsService],
 })
 export class PaymentsModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {

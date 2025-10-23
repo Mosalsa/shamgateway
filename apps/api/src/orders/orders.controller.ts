@@ -15,18 +15,19 @@ import { JwtAuthGuard } from "../common/guards/jwt-auth.guard";
 import { OrdersService } from "./orders.service";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { CancelOrderDto } from "./dto/cancel-order.dto";
-import { RefundOrderDto } from "./dto/refund-order.dto";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
 import { PrismaService } from "../../prisma/prisma.service";
 import type { TicketDocument } from "@prisma/client"; // <-- Typ für Tickets
-
+import { PaymentsService } from "../payments/payments.service"; // ⬅️ NEU
+import { RefundOrderDto } from "../orders/dto/refund-order.dto";
 @Controller("orders")
 export class OrdersController {
   constructor(
     private readonly ordersService: OrdersService,
-    private readonly prisma: PrismaService, // <-- Prisma injizieren
-    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue // <-- Queue per ctor injizieren
+    private readonly prisma: PrismaService,
+    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue,
+    private readonly payments: PaymentsService
   ) {}
 
   @UseGuards(JwtAuthGuard)
@@ -124,5 +125,15 @@ export class OrdersController {
       { removeOnComplete: true, removeOnFail: true }
     );
     return { ok: true, queued: true };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post(":id/refund")
+  async refundViaOrdersRoute(
+    @Param("id") orderId: string,
+    @Body() dto: RefundOrderDto // optional: amount/currency/reason
+  ) {
+    // delegiere an PaymentsService
+    return this.payments.refundOrder(orderId, dto);
   }
 }

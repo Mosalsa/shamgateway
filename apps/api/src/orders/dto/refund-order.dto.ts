@@ -1,18 +1,17 @@
-// import { IsString } from "class-validator";
+import { IsOptional, IsString, Matches, Length } from "class-validator";
 
-// export class RefundOrderDto {
-//   @IsString()
-//   paymentIntentId!: string;
-
-//   @IsString()
-//   currency!: string;
-
-//   @IsString()
-//   amount!: string;
-// }
-
-// apps/api/src/orders/dto/refund-order.dto.ts
-import { IsString } from "class-validator";
 export class RefundOrderDto {
-  @IsString() order_id!: string; // ord_...
+  @IsOptional()
+  @IsString()
+  @Matches(/^\d+(\.\d+)?$/) // "156.42"
+  amount?: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(3, 3) // ISO 4217
+  currency?: string;
+
+  @IsOptional()
+  @IsString()
+  reason?: string; // z.B. "customer_refund"
 }

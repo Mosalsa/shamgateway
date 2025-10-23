@@ -14,7 +14,7 @@ import {
 import type { Request } from "express";
 import { PaymentsService } from "./payments.service";
 import { CreateIntentDto } from "./dto/create-intent.dto";
-
+import { RefundOrderDto } from "../orders/dto/refund-order.dto";
 @Controller("payments")
 export class PaymentsController {
   constructor(private readonly payments: PaymentsService) {}
@@ -30,16 +30,22 @@ export class PaymentsController {
     return this.payments.createIntentForOrder(orderId);
   }
 
+  @Post("refund/:orderId")
+  @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+  async refundOrder(
+    @Param("orderId") orderId: string,
+    @Body() dto: RefundOrderDto
+  ) {
+    return this.payments.refundOrder(orderId, dto);
+  }
+
   @Post("webhook/stripe")
   @HttpCode(200)
   async stripeWebhook(
     @Req() req: Request,
     @Headers("stripe-signature") sig?: string | string[]
   ) {
-    // express.raw() setzt den Body unter req.body (Buffer)
-    const raw =
-      (req as any).rawBody ?? // falls du irgendwo rawBody setzt
-      (req as any).body; // <- Buffer von express.raw()
+    const raw = (req as any).rawBody ?? (req as any).body;
 
     if (!raw || !(raw instanceof Buffer)) {
       throw new BadRequestException(
@@ -48,5 +54,15 @@ export class PaymentsController {
     }
     const signature = Array.isArray(sig) ? sig[0] : sig;
     return this.payments.handleWebhook(raw, signature ?? "");
+  }
+
+  // NEU: Teilrefund (Stripe-only) – kein Duffel-Cancel
+  @Post("refund/stripe/:orderId")
+  @HttpCode(200)
+  async refundStripePartial(
+    @Param("orderId") orderId: string,
+    @Body() body: { amount: string; currency: string; reason?: string }
+  ) {
+    return this.payments.refundStripePartial(orderId, body);
   }
 }

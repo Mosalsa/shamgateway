@@ -6,6 +6,7 @@ import { OrdersService } from "./orders.service";
 import { EticketPollProcessor } from "../tickets/eticket-poll.processor";
 import { DuffelHttpModule } from "../common/duffel-http.module";
 import { PrismaModule } from "../../prisma/prisma.module";
+import { PaymentsModule } from "../payments/payments.module";
 
 @Module({
   imports: [
@@ -22,9 +23,8 @@ import { PrismaModule } from "../../prisma/prisma.module";
 
     // HTTP-Client für Duffel-Aufrufe (der Poller lädt /orders/{id})
     DuffelHttpModule,
-
-    // Prisma (DB-Zugriff für Controller/Service/Worker)
     PrismaModule,
+    PaymentsModule,
   ],
 
   controllers: [OrdersController],
