@@ -12,6 +12,7 @@ import { toMinorUnits, fromMinorUnits } from "./currency.util";
 import { DuffelService } from "../duffel/duffel.service";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
+import { PrismaService } from "../../prisma/prisma.service"; // ⬅️ NEU
 
 const PAYMENTS_DEBUG = process.env.PAYMENTS_DEBUG === "1";
 
@@ -32,7 +33,8 @@ export class PaymentsService {
   constructor(
     private readonly cfg: ConfigService,
     private readonly duffel: DuffelService,
-    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue
+    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue,
+    private readonly prisma: PrismaService // ⬅️ NEU
   ) {
     const key = this.cfg.get<string>("STRIPE_SECRET_KEY");
     if (!key) {
@@ -221,11 +223,12 @@ export class PaymentsService {
       throw new BadRequestException(`Webhook Error: ${err?.message}`);
     }
 
-    this.logEvent(event);
+    // optional: verbose logging
+    const base = `Stripe event: id=${event.id} type=${event.type}`;
+    if (PAYMENTS_DEBUG) this.logger.debug(`${base} payload=${safeJson(event)}`);
+    else this.logger.debug(base);
 
     switch (event.type) {
-      // apps/api/src/payments/payments.service.ts  (innerhalb switch(event.type))
-
       case "payment_intent.succeeded": {
         const pi = event.data.object as Stripe.PaymentIntent;
         this.logger.log(
@@ -238,45 +241,69 @@ export class PaymentsService {
           break;
         }
 
-        // Nur HOLD/awaiting Orders bezahlen – instant bitte überspringen
         const order = await this.duffel.getOrder(orderId);
         const awaiting =
           order?.payment_status?.awaiting_payment === true ||
           order?.type === "hold";
 
         if (!awaiting) {
-          this.logger.log(
-            `Skip Duffel payment: order ${orderId} is not awaiting payment (type=${order?.type}, awaiting=${order?.payment_status?.awaiting_payment})`
-          );
+          // INSTANT: Duffel bezahlt selbst – wir persistieren PI-Infos
+          try {
+            await this.prisma.order.update({
+              where: { duffelId: orderId },
+              data: {
+                paymentProvider: "STRIPE",
+                paymentIntentId: pi.id,
+                paymentStatus: "succeeded",
+                // status unverändert lassen; optional nachziehen, falls null:
+              },
+            });
+            // optionales Nachziehen, wenn status null ist:
+            const db = await this.prisma.order.findUnique({
+              where: { duffelId: orderId },
+              select: { status: true },
+            });
+            const fresh =
+              order?.status ?? order?.booking_conditions?.status ?? null;
+            if (!db?.status && fresh) {
+              await this.prisma.order.update({
+                where: { duffelId: orderId },
+                data: { status: fresh },
+              });
+            }
+          } catch (e) {
+            this.logger.warn(
+              `DB update (instant order) failed for ${orderId}: ${e}`
+            );
+          }
+
+          // ⬅️ NEU: Immer Poll enqueuen (auch bei Instant)
+          await this.eticketQueue
+            .add(
+              "poll",
+              { orderId, attempt: 1 },
+              {
+                jobId: `poll:${orderId}`, // de-dupe
+                delay: 3000,
+                removeOnComplete: true,
+                removeOnFail: true,
+              }
+            )
+            .catch(() => {});
           break;
         }
 
+        // HOLD: erst Duffel settle’n, dann Poll (bestehende Logik)
         const amountStr = fromMinorUnits(pi.amount, pi.currency);
         const currency = pi.currency.toUpperCase();
 
-        // optional: Plausibilitätscheck gegen Order-Totals
         try {
-          const oAmt = order?.total_amount;
-          const oCur = (order?.total_currency || "").toUpperCase();
-          if (oAmt && oCur && (oCur !== currency || oAmt !== amountStr)) {
-            this.logger.warn(
-              `Amount/Currency mismatch: PI=${amountStr} ${currency} vs Order=${oAmt} ${oCur}`
-            );
-            // ggf. break; je nach Policy
-          }
-        } catch {}
-
-        try {
-          this.logger.log(
-            `Duffel pay: order=${orderId} amount=${amountStr} currency=${currency} idem=${pi.id}`
-          );
           await this.duffel.createPayment({
             order_id: orderId,
             amount: amountStr,
-            currency, // UPPERCASE
-            idempotencyKey: pi.id, // idempotent via PI-ID
+            currency,
+            idempotencyKey: pi.id,
           });
-          // TODO: DB -> status "PAID", store pi.id
         } catch (e) {
           this.logger.error(
             `Duffel settlement failed for order ${orderId}: ${e}`
@@ -284,11 +311,34 @@ export class PaymentsService {
           throw new InternalServerErrorException("Duffel settlement failed");
         }
 
-        await this.eticketQueue.add(
-          "poll",
-          { orderId },
-          { delay: 3000, removeOnComplete: true, removeOnFail: true }
-        );
+        try {
+          await this.prisma.order.update({
+            where: { duffelId: orderId },
+            data: {
+              paymentProvider: "STRIPE",
+              paymentIntentId: pi.id,
+              paymentStatus: "succeeded",
+              paidAt: new Date(),
+              status: "paid",
+            },
+          });
+        } catch (e) {
+          this.logger.error(`DB update failed for order ${orderId}: ${e}`);
+        }
+
+        // ⬅️ NEU/Bestätigt: Poll immer enqueuen (idempotent)
+        await this.eticketQueue
+          .add(
+            "poll",
+            { orderId, attempt: 1 },
+            {
+              jobId: `poll:${orderId}`,
+              delay: 3000,
+              removeOnComplete: true,
+              removeOnFail: true,
+            }
+          )
+          .catch(() => {});
 
         break;
       }
@@ -300,21 +350,24 @@ export class PaymentsService {
 
         this.logger.warn(`PI failed: ${pi.id} ${msg} order=${orderId ?? "-"}`);
 
-        // Duffel: nichts buchen/bezahlen – es ist ja fehlgeschlagen.
-        // Business: DB markieren, User informieren
-        try {
-          // TODO: this.prisma.order.update({ where:{ duffelId: orderId }, data:{ paymentStatus:'failed' }})
-        } catch {}
+        if (orderId) {
+          try {
+            await this.prisma.order.update({
+              where: { duffelId: orderId },
+              data: { paymentStatus: "failed", status: "payment_failed" },
+            });
+          } catch (e) {
+            this.logger.warn(
+              `Could not update order ${orderId} after failed payment: ${e}`
+            );
+          }
+        }
         break;
       }
 
       case "charge.refunded":
       case "refund.updated": {
-        // Ziel: Stripe-Refunds ↔ Duffel-Konsistenz
-        // full refund -> Duffel Order cancel (Quote + Confirm)
-        // partial refund -> KEIN Auto-Handling (Order Changes/Cancellation policy-spezifisch)
-
-        // 1) Charge + PI ermitteln
+        // Stripe-Refunds ↔ Duffel-Konsistenz
         let charge: Stripe.Charge | undefined;
         if (event.type === "charge.refunded") {
           charge = event.data.object as Stripe.Charge;
@@ -343,7 +396,7 @@ export class PaymentsService {
           break;
         }
 
-        const pi = await this.getPaymentIntent(piId);
+        const pi = await this.stripe.paymentIntents.retrieve(piId);
         const orderId = pi?.metadata?.duffel_order_id;
         if (!orderId) {
           this.logger.warn(
@@ -360,10 +413,10 @@ export class PaymentsService {
         const refundedMinor = charge.amount_refunded ?? 0;
         const refunded = fromMinorUnits(refundedMinor, currency);
 
-        // 2) Duffel-Order & Totals
-        const order = await this.duffel.getOrder(orderId);
-        const total = order?.total_amount;
-        const totalCur = (order?.total_currency || "").toUpperCase();
+        // Duffel-Order totals
+        const dOrder = await this.duffel.getOrder(orderId);
+        const total = dOrder?.total_amount;
+        const totalCur = (dOrder?.total_currency || "").toUpperCase();
         if (!total || !totalCur) {
           this.logger.warn(
             `[refund] Duffel order ${orderId} has no totals; skipping auto-cancel`
@@ -371,8 +424,7 @@ export class PaymentsService {
           break;
         }
 
-        // 3) Voll vs. Teil-Refund
-        const amountsEqual = (() => {
+        const isFullRefund = (() => {
           try {
             return (
               toMinorUnits(refunded, currency) ===
@@ -383,16 +435,22 @@ export class PaymentsService {
           }
         })();
 
-        if (!amountsEqual) {
+        if (!isFullRefund) {
           // PARTIAL
           this.logger.warn(
             `[refund] partial refund: refunded=${refunded} ${currency} vs order=${total} ${totalCur} (order=${orderId}). No automatic Duffel action.`
           );
-          // TODO: DB -> PARTIALLY_REFUNDED, Ops-Case anlegen
+          // Optional: DB-Flag für teilweise erstattet
+          try {
+            await this.prisma.order.update({
+              where: { duffelId: orderId },
+              data: { paymentStatus: "partially_refunded" },
+            });
+          } catch {}
           break;
         }
 
-        // 4) FULL -> Duffel cancel (Quote + Confirm)
+        // FULL → Duffel cancel (Quote + Confirm)
         try {
           this.logger.log(
             `[refund] full refund -> cancelling Duffel order ${orderId}`
@@ -405,7 +463,19 @@ export class PaymentsService {
             quote.id
           );
 
-          // Optional: Abgleich der Beträge
+          // DB als refund mark
+          try {
+            await this.prisma.order.update({
+              where: { duffelId: orderId },
+              data: { paymentStatus: "refunded", status: "refunded" },
+            });
+          } catch (e) {
+            this.logger.warn(
+              `Order DB update (refunded) failed for ${orderId}: ${e}`
+            );
+          }
+
+          // optional: Abgleich Duffel vs Stripe Beträge loggen
           const dAmt = confirmed?.refund_amount;
           const dCur = (confirmed?.refund_currency || "").toUpperCase();
           if (dAmt && dCur && (dCur !== currency || dAmt !== refunded)) {
@@ -413,15 +483,13 @@ export class PaymentsService {
               `[refund] mismatch Duffel vs Stripe: Duffel=${dAmt} ${dCur} / Stripe=${refunded} ${currency}`
             );
           }
-
-          // TODO: DB -> REFUNDED, speichern cancellation id / charge / refund ids
         } catch (err: any) {
           this.logger.error(
             `[refund] Duffel cancellation failed for order ${orderId}: ${
               err?.message ?? err
             }`
           );
-          // kein throw -> Stripe soll Refund-Webhook nicht retry-blocken
+          // kein throw: Stripe soll Webhook nicht blockieren
         }
 
         break;
@@ -431,7 +499,6 @@ export class PaymentsService {
         this.logger.debug(`Unhandled event type: ${event.type}`);
     }
 
-    // 200 OK -> Stripe zufrieden (außer wir haben bewusst 500 geworfen für Retry)
     return { received: true };
   }
 }

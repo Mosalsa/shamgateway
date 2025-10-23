@@ -3,6 +3,7 @@
 /** Alle Event-Typen, die du abonniert hast (+ ping/testing) */
 export type DuffelWebhookType =
   | "order.created"
+  | "order.updated"
   | "order.creation_failed"
   | "order.airline_initiated_change_detected"
   | "order_cancellation.created"

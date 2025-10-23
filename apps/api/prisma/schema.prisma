@@ -118,13 +118,17 @@ model TicketDocument {
   id        String   @id @default(cuid())
   orderId   String
   type      String
-  uniqueId  String   @unique
+  uniqueId  String            // ⬅️ KEIN @unique hier!
   url       String?
   createdAt DateTime @default(now())
   order     Order    @relation("Order_TicketDocuments", fields: [orderId], references: [id], onDelete: Cascade)
 
+  @@unique([orderId, uniqueId], name: "orderId_uniqueId")  // ⬅️ EINZIGER Unique
+  @@index([uniqueId])
   @@index([orderId])
 }
+
+
 
 model OrderScheduleChange {
   id         String   @id @default(cuid())

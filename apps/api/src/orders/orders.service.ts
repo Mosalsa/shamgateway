@@ -1,20 +1,186 @@
 // apps/api/src/orders/orders.service.ts
-import { Injectable, HttpException, BadRequestException } from "@nestjs/common";
+import {
+  Injectable,
+  HttpException,
+  BadRequestException,
+  Logger,
+} from "@nestjs/common";
 import { HttpService } from "@nestjs/axios";
 import { PrismaService } from "../../prisma/prisma.service";
 import { firstValueFrom } from "rxjs";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { RefundOrderDto } from "./dto/refund-order.dto";
 import { randomBytes } from "crypto";
+import { InjectQueue } from "@nestjs/bullmq"; // ⬅️ NEU
+import { Queue } from "bullmq";
 
 @Injectable()
 export class OrdersService {
+  private readonly logger = new Logger(OrdersService.name);
   constructor(
     private readonly http: HttpService,
-    private readonly prisma: PrismaService
+    private readonly prisma: PrismaService,
+    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue // ⬅️ NEU
   ) {}
 
-  // ---- Create Order ----
+  // -------- HELPERS --------
+  private asDate(v?: string | null): Date | null {
+    return v ? new Date(v) : null;
+  }
+
+  private resolveStatusFromDuffel(o: any): string | null {
+    // Priorität: explicit, dann Ticket vorhanden → confirmed, sonst awaiting_payment → awaiting_payment
+    if (o?.status) return String(o.status);
+    if (
+      Array.isArray(o?.documents) &&
+      o.documents.some(
+        (d: any) => String(d?.type).toLowerCase() === "electronic_ticket"
+      )
+    ) {
+      return "confirmed";
+    }
+    if (o?.payment_status?.awaiting_payment === true) return "awaiting_payment";
+    return null;
+  }
+
+  /** speichert elektronische Tickets stabil anhand unique_identifier */
+  // apps/api/src/orders/orders.service.ts  – NUR diese Methode ersetzen/patchen
+  async persistTicketDocuments(
+    duffelOrderId: string,
+    docs: any[]
+  ): Promise<number> {
+    const list = Array.isArray(docs) ? docs : [];
+    const eDocs = list.filter(
+      (d) => String(d?.type ?? "").toLowerCase() === "electronic_ticket"
+    );
+    if (!eDocs.length) return 0;
+
+    // Order-FK sichern
+    let dbOrder = await this.prisma.order.findUnique({
+      where: { duffelId: duffelOrderId },
+      select: { id: true },
+    });
+    if (!dbOrder) {
+      dbOrder = await this.prisma.order.create({
+        data: {
+          duffelId: duffelOrderId,
+          offerId: "unknown",
+          userId:
+            (await this.prisma.user.findFirst({ select: { id: true } }))?.id ??
+            (
+              await this.prisma.user.create({
+                data: {
+                  email: "system@shamgateway.com",
+                  password: "N/A",
+                  role: "ADMIN" as any,
+                },
+                select: { id: true },
+              })
+            ).id,
+          amount: "0",
+          currency: "USD",
+          status: null,
+        },
+        select: { id: true },
+      });
+    }
+
+    let saved = 0;
+
+    for (let i = 0; i < eDocs.length; i++) {
+      const d = eDocs[i];
+
+      // 1) Rohwert aus Duffel (kann bei Sandbox oft "1" sein)
+      const uniqueIdRaw = d?.unique_identifier
+        ? String(d.unique_identifier)
+        : `${duffelOrderId}:${i + 1}`;
+
+      // 2) Was wir normal speichern wollen (ohne Namespace; Composite-Unique soll das lösen)
+      const uniqueId = uniqueIdRaw;
+
+      // 3) Primär: Composite-Unique (orderId, uniqueId) verwenden
+      try {
+        await this.prisma.ticketDocument.upsert({
+          where: { orderId_uniqueId: { orderId: dbOrder.id, uniqueId } },
+          update: {
+            type: d?.type ?? "electronic_ticket",
+            url: d?.url ?? null,
+          },
+          create: {
+            orderId: dbOrder.id,
+            type: d?.type ?? "electronic_ticket",
+            uniqueId,
+            url: d?.url ?? null,
+          },
+        });
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        // 3a) DB hat den Composite-Constraint noch nicht -> 42P10
+        if (msg.includes("42P10")) {
+          const syntheticId = `${dbOrder.id}:${uniqueIdRaw}`; // Primärschlüssel-UPSERT
+          try {
+            await this.prisma.ticketDocument.upsert({
+              where: { id: syntheticId },
+              update: {
+                type: d?.type ?? "electronic_ticket",
+                url: d?.url ?? null,
+                uniqueId, // kann bei altem UNIQUE(uniqueId) kollidieren
+              },
+              create: {
+                id: syntheticId,
+                orderId: dbOrder.id,
+                type: d?.type ?? "electronic_ticket",
+                uniqueId,
+                url: d?.url ?? null,
+              },
+            });
+          } catch (e2: any) {
+            const msg2 = String(e2?.message || e2);
+            // 3b) Falls noch globales UNIQUE(uniqueId) existiert -> P2002 / duplicate key
+            if (
+              msg2.includes("P2002") ||
+              msg2.toLowerCase().includes("unique constraint failed") ||
+              msg2.includes("duplicate key")
+            ) {
+              const namespacedUniqueId = `${duffelOrderId}:${uniqueIdRaw}`; // sicher eindeutig je Order
+              await this.prisma.ticketDocument.upsert({
+                where: { id: syntheticId },
+                update: {
+                  type: d?.type ?? "electronic_ticket",
+                  url: d?.url ?? null,
+                  uniqueId: namespacedUniqueId,
+                },
+                create: {
+                  id: syntheticId,
+                  orderId: dbOrder.id,
+                  type: d?.type ?? "electronic_ticket",
+                  uniqueId: namespacedUniqueId,
+                  url: d?.url ?? null,
+                },
+              });
+            } else {
+              throw e2;
+            }
+          }
+        } else {
+          throw e;
+        }
+      }
+
+      saved += 1;
+    }
+
+    if (saved > 0) {
+      await this.prisma.order.update({
+        where: { duffelId: duffelOrderId },
+        data: { status: "confirmed", eticketReady: true as any },
+      });
+    }
+
+    return saved;
+  }
+
+  // -------- CREATE ORDER (Duffel-konform, sofort persistieren) --------
   async create(dto: CreateOrderDto, currentUserId: string) {
     const body = {
       data: {
@@ -39,45 +205,104 @@ export class OrdersService {
     };
 
     const idem = randomBytes(16).toString("hex");
+
     try {
       const { data } = await firstValueFrom(
         this.http.post("/orders", body, {
           headers: { "Idempotency-Key": idem },
         })
       );
-      const order = data?.data;
-      if (!order?.id)
+
+      const o = data?.data ?? data;
+      if (!o?.id)
         throw new BadRequestException("Duffel did not return an order");
 
-      // Persist order meta (dein bestehendes Order-Model)
+      const orderType: "instant" | "hold" =
+        o?.type === "instant" || o?.type === "hold"
+          ? o.type
+          : o?.payment_status?.awaiting_payment
+          ? "hold"
+          : "instant";
+
+      // Log (klar und auffällig)
+      this.logger.log(
+        `Duffel order created: id=${
+          o.id
+        } type=${orderType} awaiting_payment=${!!o?.payment_status
+          ?.awaiting_payment} paid_at=${o?.payment_status?.paid_at ?? "null"}`
+      );
+
+      // 1) Felder aus Duffel-Order abbilden (einfach & vollständig)
+      const resolvedStatus = this.resolveStatusFromDuffel(o);
+
+      const dbData = {
+        duffelId: String(o.id),
+        offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
+        userId: currentUserId,
+        status: resolvedStatus,
+        amount: String(o.total_amount ?? "0"),
+        currency: String(o.total_currency ?? "USD"),
+        owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
+        liveMode: !!o.live_mode,
+        paymentStatus:
+          o?.payment_status?.awaiting_payment === true
+            ? "awaiting_payment"
+            : o?.payment_status?.paid_at
+            ? "succeeded"
+            : null,
+        paidAt: this.asDate(o?.payment_status?.paid_at),
+        awaitingPayment:
+          o?.payment_status?.awaiting_payment === true
+            ? true
+            : o?.payment_status?.awaiting_payment === false
+            ? false
+            : null,
+        paymentRequiredBy: this.asDate(o?.payment_status?.payment_required_by),
+        priceGuaranteeExpiresAt: this.asDate(
+          o?.payment_status?.price_guarantee_expires_at ??
+            o?.price_guarantee_expires_at
+        ),
+        bookingRef: o?.booking_reference ?? null,
+        documents: Array.isArray(o?.documents) ? (o.documents as any) : null,
+        segments: Array.isArray(o?.slices) ? (o.slices as any) : null,
+        passengers: Array.isArray(o?.passengers) ? (o.passengers as any) : null,
+        lastEventType: "order.created",
+      };
+
+      // 2) Upsert der Order (sauber & vollständig)
       await this.prisma.order.upsert({
-        where: { duffelId: order.id },
-        update: {
-          status: order.status ?? null,
-          amount: order.total_amount,
-          currency: order.total_currency,
-          owner: order.owner?.iata_code ?? order.owner?.name ?? null,
-          liveMode: !!order.live_mode,
-        },
-        create: {
-          duffelId: order.id,
-          offerId: dto.offerId,
-          userId: currentUserId,
-          status: order.status ?? null,
-          amount: order.total_amount,
-          currency: order.total_currency,
-          owner: order.owner?.iata_code ?? order.owner?.name ?? null,
-          liveMode: !!order.live_mode,
-        },
+        where: { duffelId: o.id },
+        create: dbData as any,
+        update: dbData as any,
       });
 
+      // 3) Sofort Tickets persistieren, falls bereits geliefert
+      if (Array.isArray(o?.documents) && o.documents.length > 0) {
+        await this.persistTicketDocuments(o.id, o.documents);
+      }
+
+      // (Optional) 4) Zusätzlich Poll (idempotent), falls Tickets async nachkommen
+      await this.eticketQueue
+        .add(
+          "poll",
+          { orderId: o.id, attempt: 1 },
+          {
+            jobId: `poll:${o.id}`,
+            delay: 3000,
+            removeOnComplete: true,
+            removeOnFail: true,
+          }
+        )
+        .catch(() => {});
+
+      // 5) API-Response simpel & wahr
       return {
-        order_id: order.id,
-        status: order.status ?? order.booking_conditions?.status ?? "unknown",
-        total_amount: order.total_amount,
-        total_currency: order.total_currency,
-        owner: order.owner?.iata_code ?? order.owner?.name ?? null,
-        live_mode: order.live_mode ?? false,
+        order_id: o.id,
+        status: resolvedStatus ?? "unknown",
+        total_amount: dbData.amount,
+        total_currency: dbData.currency,
+        owner: dbData.owner,
+        live_mode: !!dbData.liveMode,
       };
     } catch (err: any) {
       throw new HttpException(
@@ -227,47 +452,6 @@ export class OrdersService {
     }
   }
 
-  //
-  async persistTicketDocuments(duffelOrderId: string, docs: any[]) {
-    const eDocs = (docs ?? []).filter((d) => d?.type === "electronic_ticket");
-    if (!eDocs.length) return 0;
-
-    for (const d of eDocs) {
-      await this.prisma.ticketDocument.upsert({
-        where: { id: d.id ?? `${duffelOrderId}:${d.unique_identifier}` }, // oder cuid in create
-        update: {
-          type: d.type ?? "electronic_ticket",
-          uniqueId: d.unique_identifier ?? null,
-          url: d.url ?? null,
-        },
-        create: {
-          id: d.id ?? undefined,
-          orderId: (
-            await this.prisma.order.findUnique({
-              where: { duffelId: duffelOrderId },
-              select: { id: true },
-            })
-          )?.id!,
-          type: d.type ?? "electronic_ticket",
-          uniqueId: d.unique_identifier ?? null,
-          url: d.url ?? null,
-        },
-      });
-    }
-
-    await this.prisma.order
-      .update({
-        where: { duffelId: duffelOrderId },
-        data: {
-          status: "confirmed",
-          /* falls im Schema vorhanden: */ eticketReady: true as any,
-        },
-      })
-      .catch(() => {});
-
-    return eDocs.length;
-  }
-
   async persistAirlineChange(duffelOrderId: string, payload: any) {
     await this.prisma.orderScheduleChange.create({
       data: {
@@ -283,6 +467,7 @@ export class OrdersService {
     // TODO: Notify User/Backoffice
   }
 
+  // apps/api/src/orders/orders.service.ts (nur Funktion markCancellation)
   async markCancellation(event: "created" | "confirmed", data: any) {
     const id = data?.id;
     if (!id) return;
@@ -320,7 +505,7 @@ export class OrdersService {
       await this.prisma.order
         .update({
           where: { duffelId: data.order_id },
-          data: { status: "cancelled" },
+          data: { status: "cancelled", paymentStatus: "cancelled" }, // ⬅️ NEU
         })
         .catch(() => {});
     }

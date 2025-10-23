@@ -1,8 +1,9 @@
+// apps/api/src/tickets/eticket-poll.processor.ts
 import { Processor, WorkerHost } from "@nestjs/bullmq";
 import { Injectable, Logger } from "@nestjs/common";
 import { HttpService } from "@nestjs/axios";
 import { firstValueFrom } from "rxjs";
-import { OrdersService } from "../orders/orders.service"; // <– Pfad ggf. anpassen
+import { OrdersService } from "../orders/orders.service";
 
 @Injectable()
 @Processor("eticket-poll")
@@ -10,23 +11,22 @@ export class EticketPollProcessor extends WorkerHost {
   private readonly logger = new Logger(EticketPollProcessor.name);
 
   constructor(
-    private readonly orders: OrdersService, // wir nutzen die Persist-Helper unten
-    private readonly http: HttpService // kommt aus DuffelHttpModule
+    private readonly orders: OrdersService,
+    private readonly http: HttpService // ⬅️ kommt jetzt aus DuffelHttpModule
   ) {
     super();
-    this.logger.log("🔥 EticketPollProcessor constructed");
   }
 
   async process(job: any) {
     const raw = String(job?.data?.orderId ?? "");
-    const orderId = raw.replace(/^["']+|["']+$/g, ""); // evtl. Quotes entfernen
+    const orderId = raw.replace(/^["']+|["']+$/g, "");
     const attempt = Number(job?.data?.attempt ?? 1);
 
     this.logger.log(
       `➡️ processing job id=${job.id} orderId=${orderId} attempt=${attempt}`
     );
 
-    // 1) Order frisch von Duffel holen
+    // 1) Frisch bei Duffel holen (JETZT korrekt konfiguriert)
     let order: any;
     try {
       const resp = await firstValueFrom(this.http.get(`/orders/${orderId}`));
@@ -40,13 +40,12 @@ export class EticketPollProcessor extends WorkerHost {
       );
     }
 
-    // 2) Tickets persistieren (auch URL nachtragen, wenn später vorhanden)
+    // 2) Tickets persistieren
     const docs = order?.documents ?? [];
     const saved = await this.orders.persistTicketDocuments(orderId, docs);
 
     if (saved > 0) {
       this.logger.log(`🎟️ E-ticket(s) stored for ${orderId}: ${saved}`);
-      // Order-Status in DB aktualisieren (bereit)
       try {
         await this.orders.markEticketReady(
           orderId,
@@ -56,8 +55,8 @@ export class EticketPollProcessor extends WorkerHost {
       return true;
     }
 
-    // 3) Retry mit Backoff, bis URL/Docs da sind
-    const maxAttempts = 15; // ~10–15 Minuten
+    // 3) Retry mit Backoff
+    const maxAttempts = 15;
     if (attempt >= maxAttempts) {
       this.logger.warn(`⏭️ giving up after ${attempt} attempts for ${orderId}`);
       return true;
@@ -70,7 +69,6 @@ export class EticketPollProcessor extends WorkerHost {
     await job.queue.add(
       "poll",
       { orderId, attempt: attempt + 1 },
-
       {
         jobId: `poll:${orderId}`,
         delay,

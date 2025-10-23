@@ -4,6 +4,8 @@ import { Injectable, Logger } from "@nestjs/common";
 import { PrismaService } from "../../prisma/prisma.service";
 import { OrdersService } from "../orders/orders.service";
 import type { DuffelWebhook, DuffelOrder } from "./duffel.types";
+import { InjectQueue } from "@nestjs/bullmq"; // ⬅️ NEU
+import { Queue } from "bullmq";
 
 @Injectable()
 @Processor("duffel-webhooks")
@@ -11,7 +13,8 @@ export class DuffelWebhookProcessor extends WorkerHost {
   private readonly logger = new Logger(DuffelWebhookProcessor.name);
   constructor(
     private readonly prisma: PrismaService,
-    private readonly orders: OrdersService
+    private readonly orders: OrdersService,
+    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue // ⬅️ NEU
   ) {
     super();
   }
@@ -19,7 +22,7 @@ export class DuffelWebhookProcessor extends WorkerHost {
   async process(job: any) {
     const ev = job.data as DuffelWebhook;
 
-    // Idempotenz (fallback auf Event-ID)
+    // Idempotenz
     const key = ev.idempotency_key
       ? `${ev.type}|${ev.idempotency_key}`
       : `event|${ev.id}`;
@@ -37,9 +40,42 @@ export class DuffelWebhookProcessor extends WorkerHost {
         break;
       }
 
+      case "order.updated": {
+        const o = ev.data?.object as DuffelOrder | undefined;
+        if (o?.id) {
+          await this.upsertOrderMeta(o, ev.type);
+          // ⬅️ NEU: bei "confirmed/ticketed" direkt poll’en (idempotent)
+          const s = (o as any)?.status;
+          if (s && ["confirmed", "ticketed"].includes(String(s))) {
+            await this.eticketQueue
+              .add(
+                "poll",
+                { orderId: o.id, attempt: 1 },
+                {
+                  jobId: `poll:${o.id}`,
+                  delay: 2000,
+                  removeOnComplete: true,
+                  removeOnFail: true,
+                }
+              )
+              .catch(() => {});
+          }
+        }
+        break;
+      }
+
       case "order.airline_initiated_change_detected": {
         const o = (ev.data as any)?.object;
-        if (o?.id) await this.orders.persistAirlineChange(o.id, o);
+        if (o?.id) {
+          await this.orders.persistAirlineChange(o.id, o);
+          // ⬇️ NEU: Status auf "changed" setzen
+          await this.prisma.order
+            .update({
+              where: { duffelId: o.id },
+              data: { status: "changed" },
+            })
+            .catch(() => {});
+        }
         break;
       }
 
@@ -64,7 +100,7 @@ export class DuffelWebhookProcessor extends WorkerHost {
         this.logger.debug(`Unhandled Duffel event: ${ev.type}`);
     }
 
-    // mark processed
+    // processed markieren
     await this.prisma.processedKey.create({ data: { key } }).catch(() => {});
     await this.prisma.webhookEvent
       .update({
@@ -78,7 +114,6 @@ export class DuffelWebhookProcessor extends WorkerHost {
   private async upsertOrderMeta(o: DuffelOrder, lastEventType: string) {
     await this.prisma.order.upsert({
       where: { duffelId: o.id },
-      // create: nur Minimalwerte – i.d.R. existiert Order bereits aus deinem create()
       create: {
         duffelId: o.id,
         offerId: o.offer_id ?? "unknown",
@@ -88,7 +123,7 @@ export class DuffelWebhookProcessor extends WorkerHost {
               where: { duffelId: o.id },
               select: { userId: true },
             })
-          )?.userId ?? (await this.ensureAnyUser()).id, // Fallback
+          )?.userId ?? (await this.ensureAnyUser()).id,
         status: o.status ?? null,
         amount: o.total_amount ?? "0",
         currency: o.total_currency ?? "USD",
@@ -107,7 +142,7 @@ export class DuffelWebhookProcessor extends WorkerHost {
     });
   }
 
-  // Nur als Fallback – in Produktion bitte entfernen
+  // Fallback – in Produktion entfernen
   private async ensureAnyUser() {
     const u = await this.prisma.user.findFirst();
     if (u) return u;

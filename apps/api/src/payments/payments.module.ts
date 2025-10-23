@@ -5,9 +5,13 @@ import { PaymentsController } from "./payments.controller";
 import { PaymentsService } from "./payments.service";
 import { DuffelModule } from "../duffel/duffel.module";
 import { BullModule } from "@nestjs/bullmq";
-
+import { PrismaModule } from "../../prisma/prisma.module";
 @Module({
-  imports: [DuffelModule, BullModule.registerQueue({ name: "eticket-poll" })],
+  imports: [
+    DuffelModule,
+    BullModule.registerQueue({ name: "eticket-poll" }),
+    PrismaModule,
+  ],
   controllers: [PaymentsController],
   providers: [PaymentsService],
 })
