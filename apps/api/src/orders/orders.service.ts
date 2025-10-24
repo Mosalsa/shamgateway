@@ -11,8 +11,13 @@ import { firstValueFrom } from "rxjs";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { RefundOrderDto } from "./dto/refund-order.dto";
 import { randomBytes } from "crypto";
-import { InjectQueue } from "@nestjs/bullmq"; // ⬅️ NEU
+import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
+import {
+  CreateOrderChangeRequestDto,
+  ConfirmOrderChangeDto,
+  ChangeSliceDto,
+} from "./dto/order-change.dto";
 
 @Injectable()
 export class OrdersService {
@@ -20,12 +25,72 @@ export class OrdersService {
   constructor(
     private readonly http: HttpService,
     private readonly prisma: PrismaService,
-    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue // ⬅️ NEU
+    @InjectQueue("eticket-poll") private readonly eticketQueue: Queue
   ) {}
 
   // -------- HELPERS --------
   private asDate(v?: string | null): Date | null {
     return v ? new Date(v) : null;
+  }
+
+  private extractChangePolicy(order: any) {
+    // Duffel liefert die Policy an zwei Stellen (pro Slice u./o. top-level)
+    const top = order?.conditions?.change_before_departure;
+    const fromSlices = Array.isArray(order?.slices)
+      ? order.slices
+          .map((s: any) => s?.conditions?.change_before_departure)
+          .filter(Boolean)
+      : [];
+
+    // Wenn irgendeine Slice not-allowed ist, behandeln wir overall als not changeable.
+    const all = [top, ...fromSlices].filter(Boolean);
+    if (!all.length) return { allowed: false, reason: "no_policy" as const };
+
+    const allowed = all.every((p: any) => p?.allowed === true);
+    // Penalty konsolidieren (wenn uneinheitlich, geben wir 'mixed' zurück)
+    const currencies = [
+      ...new Set(
+        all.map((p: any) => (p?.penalty_currency || "").toUpperCase())
+      ),
+    ].filter(Boolean);
+    const amounts = [
+      ...new Set(all.map((p: any) => String(p?.penalty_amount ?? ""))),
+    ].filter(Boolean);
+
+    return {
+      allowed,
+      penalty_currency: currencies.length === 1 ? currencies[0] : null,
+      penalty_amount: amounts.length === 1 ? amounts[0] : null,
+    };
+  }
+
+  async getChangePolicy(orderId: string) {
+    const { data } = await firstValueFrom(this.http.get(`/orders/${orderId}`));
+    const o = data?.data ?? data;
+    if (!o?.id)
+      return {
+        ok: false,
+        code: "order_not_found",
+        message: `Order ${orderId} not found`,
+      };
+
+    const policy = this.extractChangePolicy(o);
+    return {
+      ok: true,
+      order_id: o.id,
+      type: o.type ?? null,
+      policy,
+      // nützlich: vorhandene Slice-IDs fürs UI/Test
+      slices: Array.isArray(o.slices)
+        ? o.slices.map((s: any, idx: number) => ({
+            index: idx,
+            id: s.id,
+            origin: s.origin?.iata_code,
+            destination: s.destination?.iata_code,
+            departing_at: s.departing_at,
+          }))
+        : [],
+    };
   }
 
   private resolveStatusFromDuffel(o: any): string | null {
@@ -44,7 +109,6 @@ export class OrdersService {
   }
 
   /** speichert elektronische Tickets stabil anhand unique_identifier */
-  // apps/api/src/orders/orders.service.ts  – NUR diese Methode ersetzen/patchen
   async persistTicketDocuments(
     duffelOrderId: string,
     docs: any[]
@@ -467,7 +531,6 @@ export class OrdersService {
     // TODO: Notify User/Backoffice
   }
 
-  // apps/api/src/orders/orders.service.ts (nur Funktion markCancellation)
   async markCancellation(event: "created" | "confirmed", data: any) {
     const id = data?.id;
     if (!id) return;
@@ -517,5 +580,422 @@ export class OrdersService {
       where: { duffelId: duffelOrderId },
       data: { eticketReady: true as any, ...(status ? { status } : {}) },
     });
+  }
+
+  // --- helper: pre-check (nicht zwingend, aber nice)
+  async isOrderChangeable(orderId: string) {
+    const { data } = await firstValueFrom(this.http.get(`/orders/${orderId}`));
+    const o = data?.data ?? data;
+    const allowed = !!o?.conditions?.change_before_departure?.allowed;
+    return {
+      ok: true,
+      order_id: orderId,
+      change_allowed: allowed,
+      penalty: {
+        amount: o?.conditions?.change_before_departure?.penalty_amount ?? null,
+        currency:
+          o?.conditions?.change_before_departure?.penalty_currency ?? null,
+      },
+      raw: o,
+    };
+  }
+
+  // --- v2 step 1: create order_change_request (quote)
+  // async createOrderChangeRequest(
+  //   orderId: string,
+  //   dto: CreateOrderChangeRequestDto
+  // ) {
+  //   const toSlice = (s: ChangeSliceDto) =>
+  //     s.slice_id
+  //       ? { slice_id: s.slice_id }
+  //       : {
+  //           origin: s.origin,
+  //           destination: s.destination,
+  //           departure_date: s.departure_date,
+  //         };
+
+  //   const body: any = { data: { order_id: orderId } };
+  //   if (dto.slices) {
+  //     body.data.slices = {};
+  //     if (dto.slices.add?.length)
+  //       body.data.slices.add = dto.slices.add.map(toSlice);
+  //     if (dto.slices.remove?.length)
+  //       body.data.slices.remove = dto.slices.remove.map(toSlice);
+  //   }
+  //   if (dto.services?.length) body.data.services = dto.services;
+
+  //   try {
+  //     const { data } = await firstValueFrom(
+  //       this.http.post(`/order_change_requests`, body)
+  //     );
+  //     const req = data?.data ?? data;
+
+  //     // optional: leicht in DB merken (nur IDs/Beträge)
+  //     await this.prisma.orderChangeRequest
+  //       ?.upsert?.({
+  //         where: { duffelRequestId: req.id },
+  //         update: {
+  //           orderDuffelId: orderId,
+  //           liveMode: !!req.live_mode,
+  //           expiresAt: req.expires_at ? new Date(req.expires_at) : null,
+  //         },
+  //         create: {
+  //           duffelRequestId: req.id,
+  //           orderDuffelId: orderId,
+  //           liveMode: !!req.live_mode,
+  //           expiresAt: req.expires_at ? new Date(req.expires_at) : null,
+  //         },
+  //       })
+  //       .catch(() => {});
+
+  //     return {
+  //       ok: true,
+  //       order_change_request_id: req.id, // req_...
+  //       expires_at: req.expires_at ?? null,
+  //       // Manche Duffel-Accounts liefern Offers inline in req; sonst leer:
+  //       offers_inline: req.order_change_offers ?? [],
+  //       raw: req,
+  //     };
+  //   } catch (err: any) {
+  //     return {
+  //       ok: false,
+  //       code: "change_request_failed",
+  //       message:
+  //         err?.response?.data?.error ??
+  //         err?.message ??
+  //         "Order change request failed",
+  //       details: err?.response?.data ?? null,
+  //     };
+  //   }
+  // }
+
+  async createOrderChangeRequest(
+    orderId: string,
+    dto: CreateOrderChangeRequestDto
+  ) {
+    const toSlice = (s: ChangeSliceDto) =>
+      s.slice_id
+        ? { slice_id: s.slice_id }
+        : {
+            origin: s.origin,
+            destination: s.destination,
+            departure_date: s.departure_date,
+          };
+
+    const body: any = { data: { order_id: orderId } };
+    if (dto.slices) {
+      body.data.slices = {};
+      if (dto.slices.add?.length)
+        body.data.slices.add = dto.slices.add.map(toSlice);
+      if (dto.slices.remove?.length)
+        body.data.slices.remove = dto.slices.remove.map(toSlice);
+    }
+    if (dto.services?.length) body.data.services = dto.services;
+
+    try {
+      const { data } = await firstValueFrom(
+        this.http.post(`/order_change_requests`, body)
+      );
+      const req = data?.data ?? data;
+
+      // 🔸 Minimal persistieren (Option-B)
+      await this.prisma.orderChangeRequest.upsert({
+        where: { duffelRequestId: req.id },
+        update: {
+          orderDuffelId: orderId,
+          liveMode: !!req.live_mode,
+          expiresAt: req.expires_at ? new Date(req.expires_at) : null,
+          raw: req,
+        },
+        create: {
+          duffelRequestId: req.id,
+          orderDuffelId: orderId,
+          liveMode: !!req.live_mode,
+          expiresAt: req.expires_at ? new Date(req.expires_at) : null,
+          raw: req,
+        },
+      });
+
+      return {
+        ok: true,
+        order_change_request_id: req.id,
+        expires_at: req.expires_at ?? null,
+        offers_inline: Array.isArray(req.order_change_offers)
+          ? req.order_change_offers
+          : [],
+        raw: req,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        code: "change_request_failed",
+        message:
+          err?.response?.data?.error ??
+          err?.message ??
+          "Order change request failed",
+        details: err?.response?.data ?? null,
+      };
+    }
+  }
+
+  // --- v2 step 2: list order_change_offers for a request
+  // async listOrderChangeOffers(
+  //   order_change_request_id: string,
+  //   query?: { after?: string; limit?: number }
+  // ) {
+  //   try {
+  //     const { data } = await firstValueFrom(
+  //       this.http.get(`/order_change_offers`, {
+  //         params: { order_change_request_id, ...(query ?? {}) },
+  //       })
+  //     );
+  //     const res = data?.data ?? data;
+  //     return {
+  //       ok: true,
+  //       order_change_request_id,
+  //       offers: Array.isArray(res) ? res : res?.order_change_offers ?? [],
+  //       raw: res,
+  //     };
+  //   } catch (err: any) {
+  //     return {
+  //       ok: false,
+  //       code: "offers_list_failed",
+  //       message:
+  //         err?.response?.data?.error ??
+  //         err?.message ??
+  //         "Order change offers list failed",
+  //       details: err?.response?.data ?? null,
+  //     };
+  //   }
+  // }
+
+  async listOrderChangeOffers(
+    order_change_request_id: string,
+    query?: { after?: string; limit?: number }
+  ) {
+    try {
+      const { data } = await firstValueFrom(
+        this.http.get(`/order_change_offers`, {
+          params: { order_change_request_id, ...(query ?? {}) },
+        })
+      );
+      const payload = data?.data ?? data;
+      const offers: any[] = Array.isArray(payload)
+        ? payload
+        : payload?.order_change_offers ?? [];
+
+      // 🔸 Offers in DB spiegeln (Option-B)
+      for (const off of offers) {
+        await this.prisma.orderChangeOffer.upsert({
+          where: { duffelOfferId: off.id },
+          update: {
+            requestDuffelId: order_change_request_id,
+            penaltyAmount: off.penalty_total_amount ?? null,
+            penaltyCurrency: off.penalty_total_currency ?? null,
+            changeTotalAmount: off.change_total_amount ?? null,
+            changeTotalCurrency: off.change_total_currency ?? null,
+            newTotalAmount: off.new_total_amount ?? null,
+            newTotalCurrency: off.new_total_currency ?? null,
+            availablePaymentTypes: Array.isArray(off.available_payment_types)
+              ? off.available_payment_types
+              : [],
+            raw: off,
+          },
+          create: {
+            duffelOfferId: off.id,
+            requestDuffelId: order_change_request_id,
+            penaltyAmount: off.penalty_total_amount ?? null,
+            penaltyCurrency: off.penalty_total_currency ?? null,
+            changeTotalAmount: off.change_total_amount ?? null,
+            changeTotalCurrency: off.change_total_currency ?? null,
+            newTotalAmount: off.new_total_amount ?? null,
+            newTotalCurrency: off.new_total_currency ?? null,
+            availablePaymentTypes: Array.isArray(off.available_payment_types)
+              ? off.available_payment_types
+              : [],
+            raw: off,
+          },
+        });
+      }
+
+      return {
+        ok: true,
+        order_change_request_id,
+        count: offers.length,
+        offers,
+        raw: payload,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        code: "offers_list_failed",
+        message:
+          err?.response?.data?.error ??
+          err?.message ??
+          "Order change offers list failed",
+        details: err?.response?.data ?? null,
+      };
+    }
+  }
+
+  // --- v2 step 3: confirm (creates /air/order_changes)
+  // async confirmOrderChange(dto: ConfirmOrderChangeDto) {
+  //   const payload: any = {
+  //     data: {
+  //       order_change_request_id: dto.order_change_request_id,
+  //       selected_order_change_offer: dto.selected_order_change_offer,
+  //       ...(dto.payments?.length ? { payments: dto.payments } : {}),
+  //     },
+  //   };
+
+  //   try {
+  //     const { data } = await firstValueFrom(
+  //       this.http.post(`/order_changes`, payload)
+  //     );
+  //     const confirmed = data?.data ?? data;
+
+  //     // optional DB update + eTicket poll
+  //     if (confirmed?.order_id) {
+  //       await this.prisma.order
+  //         .update({
+  //           where: { duffelId: confirmed.order_id },
+  //           data: { status: "confirmed", lastEventType: "order.changed" },
+  //         })
+  //         .catch(() => {});
+  //       await this.eticketQueue
+  //         .add(
+  //           "poll",
+  //           { orderId: confirmed.order_id, attempt: 1 },
+  //           {
+  //             jobId: `poll:${confirmed.order_id}`,
+  //             delay: 3000,
+  //             removeOnComplete: true,
+  //             removeOnFail: true,
+  //           }
+  //         )
+  //         .catch(() => {});
+  //     }
+
+  //     return {
+  //       ok: true,
+  //       change_id: confirmed.id, // ocr_...
+  //       order_id: confirmed.order_id ?? null,
+  //       confirmed_at: confirmed.confirmed_at ?? new Date().toISOString(),
+  //       new_total_amount: confirmed.new_total_amount ?? null,
+  //       new_total_currency: confirmed.new_total_currency ?? null,
+  //       penalty_amount: confirmed.penalty_total_amount ?? null,
+  //       penalty_currency: confirmed.penalty_total_currency ?? null,
+  //       raw: confirmed,
+  //     };
+  //   } catch (err: any) {
+  //     return {
+  //       ok: false,
+  //       code: "change_confirm_failed",
+  //       message:
+  //         err?.response?.data?.error ??
+  //         err?.message ??
+  //         "Order change confirmation failed",
+  //       details: err?.response?.data ?? null,
+  //     };
+  //   }
+  // }
+
+  // dto: { order_change_request_id: string; selected_order_change_offer: string; payments?: [...] }
+  async confirmOrderChange(dto: ConfirmOrderChangeDto) {
+    const payload: any = {
+      data: {
+        order_change_request_id: dto.order_change_request_id,
+        selected_order_change_offer: dto.selected_order_change_offer,
+        ...(dto.payments?.length ? { payments: dto.payments } : {}),
+      },
+    };
+
+    try {
+      const { data } = await firstValueFrom(
+        this.http.post(`/order_changes`, payload)
+      );
+      const confirmed = data?.data ?? data;
+
+      // 🔸 Persist Change (Option-B)
+      await this.prisma.orderChange.upsert({
+        where: { duffelChangeId: confirmed.id },
+        update: {
+          orderDuffelId: confirmed.order_id ?? null,
+          requestDuffelId: dto.order_change_request_id,
+          offerDuffelId: dto.selected_order_change_offer,
+          penaltyAmount: confirmed.penalty_total_amount ?? null,
+          penaltyCurrency: confirmed.penalty_total_currency ?? null,
+          changeTotalAmount: confirmed.change_total_amount ?? null,
+          changeTotalCurrency: confirmed.change_total_currency ?? null,
+          newTotalAmount: confirmed.new_total_amount ?? null,
+          newTotalCurrency: confirmed.new_total_currency ?? null,
+          confirmedAt: confirmed.confirmed_at
+            ? new Date(confirmed.confirmed_at)
+            : new Date(),
+          raw: confirmed,
+        },
+        create: {
+          duffelChangeId: confirmed.id,
+          orderDuffelId: confirmed.order_id ?? null,
+          requestDuffelId: dto.order_change_request_id,
+          offerDuffelId: dto.selected_order_change_offer,
+          penaltyAmount: confirmed.penalty_total_amount ?? null,
+          penaltyCurrency: confirmed.penalty_total_currency ?? null,
+          changeTotalAmount: confirmed.change_total_amount ?? null,
+          changeTotalCurrency: confirmed.change_total_currency ?? null,
+          newTotalAmount: confirmed.new_total_amount ?? null,
+          newTotalCurrency: confirmed.new_total_currency ?? null,
+          confirmedAt: confirmed.confirmed_at
+            ? new Date(confirmed.confirmed_at)
+            : new Date(),
+          raw: confirmed,
+        },
+      });
+
+      // 🔸 kleine DB-Order-Infos aktualisieren & eTicket-Poller
+      if (confirmed?.order_id) {
+        await this.prisma.order
+          .update({
+            where: { duffelId: confirmed.order_id },
+            data: { status: "confirmed", lastEventType: "order.changed" },
+          })
+          .catch(() => {});
+
+        await this.eticketQueue
+          .add(
+            "poll",
+            { orderId: confirmed.order_id, attempt: 1 },
+            {
+              jobId: `poll:${confirmed.order_id}`,
+              delay: 3000,
+              removeOnComplete: true,
+              removeOnFail: true,
+            }
+          )
+          .catch(() => {});
+      }
+
+      return {
+        ok: true,
+        change_id: confirmed.id,
+        order_id: confirmed.order_id ?? null,
+        confirmed_at: confirmed.confirmed_at ?? new Date().toISOString(),
+        new_total_amount: confirmed.new_total_amount ?? null,
+        new_total_currency: confirmed.new_total_currency ?? null,
+        penalty_amount: confirmed.penalty_total_amount ?? null,
+        penalty_currency: confirmed.penalty_total_currency ?? null,
+        raw: confirmed,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        code: "change_confirm_failed",
+        message:
+          err?.response?.data?.error ??
+          err?.message ??
+          "Order change confirmation failed",
+        details: err?.response?.data ?? null,
+      };
+    }
   }
 }

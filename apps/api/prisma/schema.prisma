@@ -118,17 +118,15 @@ model TicketDocument {
   id        String   @id @default(cuid())
   orderId   String
   type      String
-  uniqueId  String            // ⬅️ KEIN @unique hier!
+  uniqueId  String // ⬅️ KEIN @unique hier!
   url       String?
   createdAt DateTime @default(now())
   order     Order    @relation("Order_TicketDocuments", fields: [orderId], references: [id], onDelete: Cascade)
 
-  @@unique([orderId, uniqueId], name: "orderId_uniqueId")  // ⬅️ EINZIGER Unique
+  @@unique([orderId, uniqueId], name: "orderId_uniqueId") // ⬅️ EINZIGER Unique
   @@index([uniqueId])
   @@index([orderId])
 }
-
-
 
 model OrderScheduleChange {
   id         String   @id @default(cuid())
@@ -141,6 +139,54 @@ model OrderScheduleChange {
 
   @@index([orderId])
   @@index([resolved])
+}
+
+model OrderChangeRequest {
+  id              String    @id @default(cuid())
+  duffelRequestId String    @unique // <-- vom Duffel: ocr_...
+  orderDuffelId   String // <-- ord_...
+  liveMode        Boolean   @default(false)
+  expiresAt       DateTime?
+  raw             Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OrderChangeOffer {
+  id                    String   @id @default(cuid())
+  duffelOfferId         String   @unique // <-- oco_...
+  requestDuffelId       String // <-- ocr_...
+  penaltyAmount         String?
+  penaltyCurrency       String?
+  changeTotalAmount     String?
+  changeTotalCurrency   String?
+  newTotalAmount        String?
+  newTotalCurrency      String?
+  availablePaymentTypes String[] // z.B. ["balance","card"]
+  raw                   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OrderChange {
+  id                  String    @id @default(cuid())
+  duffelChangeId      String    @unique // <-- oce_...
+  orderDuffelId       String? // <-- ord_...
+  requestDuffelId     String? // <-- ocr_...
+  offerDuffelId       String? // <-- oco_...
+  penaltyAmount       String?
+  penaltyCurrency     String?
+  changeTotalAmount   String?
+  changeTotalCurrency String?
+  newTotalAmount      String?
+  newTotalCurrency    String?
+  confirmedAt         DateTime?
+  raw                 Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 enum Role {

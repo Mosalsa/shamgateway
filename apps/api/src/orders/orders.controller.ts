@@ -17,6 +17,10 @@ import { CreateOrderDto } from "./dto/create-order.dto";
 import { CancelOrderDto } from "./dto/cancel-order.dto";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
+import {
+  CreateOrderChangeRequestDto,
+  ConfirmOrderChangeDto,
+} from "./dto/order-change.dto";
 import { PrismaService } from "../../prisma/prisma.service";
 import type { TicketDocument } from "@prisma/client"; // <-- Typ für Tickets
 import { PaymentsService } from "../payments/payments.service"; // ⬅️ NEU
@@ -27,7 +31,8 @@ export class OrdersController {
     private readonly ordersService: OrdersService,
     private readonly prisma: PrismaService,
     @InjectQueue("eticket-poll") private readonly eticketQueue: Queue,
-    private readonly payments: PaymentsService
+    private readonly payments: PaymentsService,
+    private readonly orders: OrdersService
   ) {}
 
   @UseGuards(JwtAuthGuard)
@@ -135,5 +140,44 @@ export class OrdersController {
   ) {
     // delegiere an PaymentsService
     return this.payments.refundOrder(orderId, dto);
+  }
+
+  @Get(":orderId/change/policy")
+  getChangePolicy(@Param("orderId") orderId: string) {
+    return this.orders.getChangePolicy(orderId);
+  }
+
+  // Optional: vorab prüfen
+  @Get(":orderId/change/eligibility")
+  changeEligibility(@Param("orderId") orderId: string) {
+    return this.orders.isOrderChangeable(orderId);
+  }
+
+  // Step 1: Request (Quote)
+  @Post(":orderId/changes/request")
+  createChangeRequest(
+    @Param("orderId") orderId: string,
+    @Body() dto: CreateOrderChangeRequestDto
+  ) {
+    return this.orders.createOrderChangeRequest(orderId, dto);
+  }
+
+  // Step 2: Offers für eine Request ID
+  @Get("change_requests/:requestId/offers")
+  listChangeOffers(
+    @Param("requestId") requestId: string,
+    @Query("after") after?: string,
+    @Query("limit") limit?: string
+  ) {
+    return this.orders.listOrderChangeOffers(requestId, {
+      after,
+      limit: limit ? Number(limit) : undefined,
+    });
+  }
+
+  // Step 3: Confirm
+  @Post("changes/confirm")
+  confirmChange(@Body() dto: ConfirmOrderChangeDto) {
+    return this.orders.confirmOrderChange(dto);
   }
 }

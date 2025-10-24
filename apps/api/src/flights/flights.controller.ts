@@ -7,6 +7,8 @@ import {
   Query,
   Param,
   BadRequestException,
+  UsePipes,
+  ValidationPipe,
 } from "@nestjs/common";
 import { FlightsService } from "./flights.service";
 import { CreateOfferRequestDto } from "./dto/create-offer-request.dto";
@@ -129,5 +131,18 @@ export class FlightsController {
     if (!id)
       throw new BadRequestException("batch offer_request id is required");
     return this.flights.getBatchOfferRequest(id);
+  }
+
+  // ⬇️ NEU: kompakte Zählung instant vs hold aus den Offer-Ergebnissen
+  @Post("search/summary")
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    })
+  )
+  searchSummary(@Body() dto: SearchFlightsDto) {
+    return this.flights.searchSummary(dto);
   }
 }

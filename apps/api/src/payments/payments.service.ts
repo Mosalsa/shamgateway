@@ -4,7 +4,6 @@ import {
   BadRequestException,
   Logger,
   InternalServerErrorException,
-  NotFoundException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import Stripe from "stripe";
@@ -63,6 +62,59 @@ export class PaymentsService {
     }
   }
 
+  // ---- kleine Helper für konsistente 200-Antworten ----
+  private resultOk<T = any>(data?: T, extra: Record<string, any> = {}) {
+    return { ok: true, ...(data ?? {}), ...extra };
+  }
+  private resultFail(
+    code: string,
+    message: string,
+    details?: any,
+    extra: Record<string, any> = {}
+  ) {
+    return {
+      ok: false,
+      code,
+      message,
+      ...(details ? { details } : {}),
+      ...extra,
+    };
+  }
+
+  // ⬇️ Füge diese Helper-Methode in die Klasse PaymentsService ein (z.B. unter getPaymentIntent)
+  private async getChargesForPaymentIntent(
+    piId: string
+  ): Promise<Stripe.Charge[]> {
+    // 1) Versuche, den PI MIT expand=charges zu holen
+    try {
+      const pi = await this.stripe.paymentIntents.retrieve(piId, {
+        expand: ["charges.data"], // liefert charges.data mit zurück
+      });
+      const expanded = (pi as any)?.charges?.data as
+        | Stripe.Charge[]
+        | undefined;
+      if (Array.isArray(expanded) && expanded.length) return expanded;
+    } catch (e) {
+      this.logger.warn(
+        `[refundPartial] PI retrieve (expand charges) failed for ${piId}: ${e}`
+      );
+    }
+
+    // 2) Fallback: Charges direkt listen
+    try {
+      const list = await this.stripe.charges.list({
+        payment_intent: piId,
+        limit: 100,
+      });
+      if (Array.isArray(list.data) && list.data.length) return list.data;
+    } catch (e) {
+      this.logger.warn(`[refundPartial] charges.list failed for ${piId}: ${e}`);
+    }
+
+    // 3) Letzter Fallback: leer
+    return [];
+  }
+
   /** Vergleicht zwei Beträge als Strings mit Währungs-Exponent, z.B. "123.40" EUR */
   private amountsEqual(a: string, b: string, currency: string) {
     try {
@@ -90,7 +142,6 @@ export class PaymentsService {
     const confirmed = await this.duffel.confirmOrderCancellation(quote.id);
     return confirmed;
   }
-  // ==========================================================================
 
   /** holt (falls nötig) den PI, um z. B. metadata.duffel_order_id zu lesen */
   private async getPaymentIntent(
@@ -157,23 +208,37 @@ export class PaymentsService {
     }
   }
 
+  // ------- Create PI für Duffel Order (nur HOLD) -------
   async createIntentForOrder(orderId: string, userId?: string) {
     const order = await this.duffel.getOrder(orderId);
     if (!order?.id || !order?.total_amount || !order?.total_currency) {
-      throw new BadRequestException("Duffel order not found or missing totals");
+      return this.resultFail(
+        "order_not_found",
+        "Duffel order not found or missing totals",
+        { order_id: orderId }
+      );
     }
 
-    // 🚧 NEU: Zahlstatus prüfen – nur HOLD/awaiting_payment darf PI bekommen
-    const awaiting =
-      order?.payment_status?.awaiting_payment === true ||
-      order?.type === "hold";
+    // Duffel-Semantik:
+    // - HOLD:   payment_status.awaiting_payment === true
+    // - INSTANT:meist paid_at != null und awaiting_payment === false
+    const awaiting = order?.payment_status?.awaiting_payment === true;
+    const alreadyPaid = !!order?.payment_status?.paid_at;
+    const isInstant = String(order?.type || "").toLowerCase() === "instant";
 
-    if (!awaiting) {
-      // Order ist bereits bezahlt (instant/balance) -> KEIN Stripe-PI erzeugen
-      throw new BadRequestException(
-        `Order ${order.id} is not awaiting payment (type=${
-          order?.type
-        }, paid_at=${order?.payment_status?.paid_at ?? "n/a"})`
+    if (!awaiting || alreadyPaid || isInstant) {
+      // 200 + erklärender Body statt 400
+      return this.resultFail(
+        "already_paid_or_instant",
+        `Order is not awaiting payment (type=${
+          order?.type ?? "unknown"
+        }, paid_at=${order?.payment_status?.paid_at ?? "null"})`,
+        {
+          order_id: order.id,
+          type: order?.type ?? null,
+          payment_status: order?.payment_status ?? null,
+          hint: "Create a HOLD order (no payments in /orders), then create a Stripe PI and settle via Duffel Payments.",
+        }
       );
     }
 
@@ -181,7 +246,15 @@ export class PaymentsService {
     try {
       amountMinor = toMinorUnits(order.total_amount, order.total_currency);
     } catch {
-      throw new BadRequestException("Invalid Duffel totals");
+      return this.resultFail(
+        "invalid_totals",
+        "Invalid amount/currency on Duffel order",
+        {
+          order_id: order.id,
+          total_amount: order.total_amount,
+          total_currency: order.total_currency,
+        }
+      );
     }
 
     const idemKey = crypto
@@ -204,15 +277,17 @@ export class PaymentsService {
         { idempotencyKey: idemKey }
       );
 
-      return {
+      return this.resultOk({
         id: intent.id,
         client_secret: intent.client_secret,
         amount: order.total_amount,
         currency: order.total_currency.toUpperCase(),
-      };
+      });
     } catch (e: any) {
-      throw new InternalServerErrorException(
-        `Stripe PI create (order) failed: ${e?.message ?? "unknown"}`
+      return this.resultFail(
+        "stripe_pi_create_failed",
+        e?.message ?? "Stripe PI create failed",
+        { order_id: order.id }
       );
     }
   }
@@ -517,24 +592,208 @@ export class PaymentsService {
     return { received: true };
   }
 
-  // ====== Refund Orchestrierung (API) ======
-  // ====== Refund Orchestrierung (API) ======
+  // async refundOrder(orderId: string, dto: RefundOrderDto = {}) {
+  //   // 0) Vorab: Duffel-Order laden & Policy prüfen (freundlicher Fehler)
+  //   try {
+  //     const dOrder = await this.duffel.getOrder(orderId);
+  //     const refundable = !!dOrder?.conditions?.refund_before_departure?.allowed;
+  //     if (!refundable) {
+  //       throw new BadRequestException(
+  //         "Order is not refundable per Duffel policy"
+  //       );
+  //     }
+  //   } catch (e: any) {
+  //     if (e instanceof BadRequestException) throw e;
+  //     // Wenn der Check fehlschlägt, lassen wir Duffel im nächsten Schritt sprechen
+  //   }
+
+  //   // 1) DB-Order holen (für currency/amount & PI)
+  //   const dbOrder = await this.prisma.order.findUnique({
+  //     where: { duffelId: orderId },
+  //     select: {
+  //       id: true,
+  //       amount: true,
+  //       currency: true,
+  //       paymentIntentId: true,
+  //     },
+  //   });
+  //   if (!dbOrder) {
+  //     throw new NotFoundException(`Order ${orderId} not found`);
+  //   }
+
+  //   // 2) PaymentIntent bestimmen (für Stripe partial/full refund)
+  //   let pi: Stripe.PaymentIntent | undefined;
+  //   if (dbOrder.paymentIntentId) {
+  //     try {
+  //       pi = await this.stripe.paymentIntents.retrieve(dbOrder.paymentIntentId);
+  //     } catch {}
+  //   }
+  //   if (!pi) {
+  //     try {
+  //       const res = await this.stripe.paymentIntents.search({
+  //         query: `metadata['duffel_order_id']:'${orderId}' AND status:'succeeded'`,
+  //         limit: 1,
+  //       });
+  //       pi = res.data?.[0];
+  //     } catch (e) {
+  //       this.logger.warn(`Stripe search PI failed for ${orderId}: ${e}`);
+  //     }
+  //   }
+
+  //   // 3) Refund-Betrag bestimmen (minor units, nur für Stripe)
+  //   const refundCurrency =
+  //     dto.currency?.toUpperCase() ??
+  //     dbOrder.currency?.toUpperCase() ??
+  //     pi?.currency?.toUpperCase() ??
+  //     "EUR";
+
+  //   let amountMinor: number | undefined;
+  //   if (dto.amount) {
+  //     amountMinor = toMinorUnits(dto.amount, refundCurrency);
+  //   } else if (dbOrder.amount && dbOrder.currency) {
+  //     amountMinor = toMinorUnits(dbOrder.amount, dbOrder.currency);
+  //   } else if (pi) {
+  //     amountMinor = pi.amount_received ?? pi.amount ?? undefined;
+  //   }
+
+  //   // 4) Duffel: Cancellation (Quote + Confirm)
+  //   let duffelCancel: any | undefined;
+  //   try {
+  //     this.logger.log(`[refund] Duffel cancellation start for ${orderId}`);
+  //     const quote = await this.duffel.createOrderCancellation({
+  //       order_id: orderId,
+  //       reason: dto.reason ?? "customer_refund",
+  //     });
+
+  //     this.logger.log(
+  //       `[refund] quote id=${quote?.id} amount=${quote?.refund_amount ?? "?"} ${
+  //         quote?.refund_currency ?? ""
+  //       } expires_at=${quote?.expires_at ?? "?"}`
+  //     );
+
+  //     duffelCancel = await this.duffel.confirmOrderCancellation(quote.id);
+
+  //     if (!duffelCancel?.id) {
+  //       throw new BadRequestException("Duffel returned no confirmation id");
+  //     }
+  //   } catch (e: any) {
+  //     const msg =
+  //       e?.response?.data?.errors?.[0]?.message ??
+  //       e?.response?.data?.error ??
+  //       e?.message ??
+  //       "Duffel cancellation confirm failed";
+
+  //     this.logger.error(`[refund] Duffel confirm error for ${orderId}: ${msg}`);
+  //     throw new BadRequestException({
+  //       message: "Duffel cancellation could not be confirmed; refund aborted",
+  //       duffel_error: msg,
+  //     });
+  //   }
+
+  //   // 5) Stripe: (optional) wirklichen Geld-Refund auslösen, falls PI vorhanden
+  //   let stripeRefund: Stripe.Response<Stripe.Refund> | null = null;
+  //   if (pi) {
+  //     try {
+  //       if (!amountMinor || amountMinor <= 0) {
+  //         // Fallback: Full refund mit PI-amount_received
+  //         amountMinor = pi.amount_received ?? pi.amount ?? undefined;
+  //       }
+  //       if (!amountMinor || amountMinor <= 0) {
+  //         throw new BadRequestException(
+  //           "Refund amount could not be determined"
+  //         );
+  //       }
+
+  //       stripeRefund = await this.stripe.refunds.create({
+  //         payment_intent: pi.id,
+  //         amount: amountMinor,
+  //         reason: "requested_by_customer",
+  //       });
+  //     } catch (e: any) {
+  //       this.logger.error(
+  //         `[refund] Stripe refund failed for ${orderId} / PI=${
+  //           pi?.id ?? "?"
+  //         }: ${e?.message ?? e}`
+  //       );
+  //       // Kein Throw: Duffel ist bereits storniert – wir geben klaren Status zurück.
+  //     }
+  //   } else {
+  //     this.logger.warn(
+  //       `[refund] No Stripe PI found for ${orderId}; skipping Stripe refund`
+  //     );
+  //   }
+
+  //   // 6) DB updaten
+  //   try {
+  //     await this.prisma.order.update({
+  //       where: { duffelId: orderId },
+  //       data: {
+  //         status: "cancelled",
+  //         paymentStatus: stripeRefund ? "refunded" : "cancelled",
+  //       },
+  //     });
+
+  //     // optional: Refund-Row persistieren
+  //     try {
+  //       await this.prisma.refund.create({
+  //         data: {
+  //           duffelId:
+  //             duffelCancel?.id ??
+  //             (stripeRefund
+  //               ? `stripe_${stripeRefund.id}`
+  //               : `duffel_${duffelCancel?.id ?? "unknown"}`),
+  //           orderId: dbOrder.id,
+  //           amount:
+  //             dto.amount ??
+  //             dbOrder.amount ??
+  //             (amountMinor ? fromMinorUnits(amountMinor, refundCurrency) : "0"),
+  //           currency: refundCurrency,
+  //           status: stripeRefund ? "succeeded" : "cancelled",
+  //         },
+  //       });
+  //     } catch {}
+  //   } catch (e) {
+  //     this.logger.warn(`[refund] DB update failed for ${orderId}: ${e}`);
+  //   }
+
+  //   return {
+  //     ok: true,
+  //     order_id: orderId,
+  //     duffel_cancellation_id: duffelCancel?.id ?? null,
+  //     stripe_refund_id: stripeRefund?.id ?? null,
+  //     amount:
+  //       amountMinor && amountMinor > 0
+  //         ? fromMinorUnits(amountMinor, refundCurrency)
+  //         : dto.amount ?? dbOrder.amount ?? null,
+  //     currency: refundCurrency,
+  //   };
+  // }
+
+  // ====== Refund Orchestrierung (API) – jetzt ohne 400-Throw, liefert ok:false ======
   async refundOrder(orderId: string, dto: RefundOrderDto = {}) {
-    // 0) Vorab: Duffel-Order laden & Policy prüfen (freundlicher Fehler)
+    // 0) Vorab-Policy-Check (freundliche Antwort statt Exception)
     try {
       const dOrder = await this.duffel.getOrder(orderId);
       const refundable = !!dOrder?.conditions?.refund_before_departure?.allowed;
       if (!refundable) {
-        throw new BadRequestException(
-          "Order is not refundable per Duffel policy"
+        return this.resultFail(
+          "not_refundable",
+          "Order is not refundable per Duffel policy",
+          {
+            order_id: orderId,
+            policy: dOrder?.conditions?.refund_before_departure ?? null,
+            type: dOrder?.type ?? null,
+          }
         );
       }
     } catch (e: any) {
-      if (e instanceof BadRequestException) throw e;
-      // Wenn der Check fehlschlägt, lassen wir Duffel im nächsten Schritt sprechen
+      // Wenn der Check scheitert, fahren wir fort und lassen ggf. Duffel sprechen.
+      this.logger.warn(
+        `[refund] pre-check failed for ${orderId}: ${e?.message ?? e}`
+      );
     }
 
-    // 1) DB-Order holen (für currency/amount & PI)
+    // 1) DB-Order
     const dbOrder = await this.prisma.order.findUnique({
       where: { duffelId: orderId },
       select: {
@@ -545,10 +804,10 @@ export class PaymentsService {
       },
     });
     if (!dbOrder) {
-      throw new NotFoundException(`Order ${orderId} not found`);
+      return this.resultFail("order_not_found", `Order ${orderId} not found`);
     }
 
-    // 2) PaymentIntent bestimmen (für Stripe partial/full refund)
+    // 2) PaymentIntent (optional)
     let pi: Stripe.PaymentIntent | undefined;
     if (dbOrder.paymentIntentId) {
       try {
@@ -567,7 +826,7 @@ export class PaymentsService {
       }
     }
 
-    // 3) Refund-Betrag bestimmen (minor units, nur für Stripe)
+    // 3) Betrag (minor) nur für Stripe
     const refundCurrency =
       dto.currency?.toUpperCase() ??
       dbOrder.currency?.toUpperCase() ??
@@ -576,14 +835,22 @@ export class PaymentsService {
 
     let amountMinor: number | undefined;
     if (dto.amount) {
-      amountMinor = toMinorUnits(dto.amount, refundCurrency);
+      try {
+        amountMinor = toMinorUnits(dto.amount, refundCurrency);
+      } catch {
+        return this.resultFail(
+          "invalid_amount",
+          "Refund amount has invalid format",
+          { amount: dto.amount, currency: refundCurrency }
+        );
+      }
     } else if (dbOrder.amount && dbOrder.currency) {
       amountMinor = toMinorUnits(dbOrder.amount, dbOrder.currency);
     } else if (pi) {
       amountMinor = pi.amount_received ?? pi.amount ?? undefined;
     }
 
-    // 4) Duffel: Cancellation (Quote + Confirm)
+    // 4) Duffel: Quote + Confirm (freundliche Fehler)
     let duffelCancel: any | undefined;
     try {
       this.logger.log(`[refund] Duffel cancellation start for ${orderId}`);
@@ -601,7 +868,11 @@ export class PaymentsService {
       duffelCancel = await this.duffel.confirmOrderCancellation(quote.id);
 
       if (!duffelCancel?.id) {
-        throw new BadRequestException("Duffel returned no confirmation id");
+        return this.resultFail(
+          "duffel_no_confirmation",
+          "Duffel returned no confirmation id",
+          { order_id: orderId, quote_id: quote?.id ?? null }
+        );
       }
     } catch (e: any) {
       const msg =
@@ -611,38 +882,38 @@ export class PaymentsService {
         "Duffel cancellation confirm failed";
 
       this.logger.error(`[refund] Duffel confirm error for ${orderId}: ${msg}`);
-      throw new BadRequestException({
-        message: "Duffel cancellation could not be confirmed; refund aborted",
-        duffel_error: msg,
-      });
+      return this.resultFail(
+        "duffel_confirm_failed",
+        "Duffel cancellation could not be confirmed; refund aborted",
+        { duffel_error: msg, order_id: orderId }
+      );
     }
 
-    // 5) Stripe: (optional) wirklichen Geld-Refund auslösen, falls PI vorhanden
+    // 5) Stripe: optionaler Geld-Refund (falls PI vorhanden)
     let stripeRefund: Stripe.Response<Stripe.Refund> | null = null;
     if (pi) {
       try {
         if (!amountMinor || amountMinor <= 0) {
-          // Fallback: Full refund mit PI-amount_received
           amountMinor = pi.amount_received ?? pi.amount ?? undefined;
         }
-        if (!amountMinor || amountMinor <= 0) {
-          throw new BadRequestException(
-            "Refund amount could not be determined"
+        if (amountMinor && amountMinor > 0) {
+          stripeRefund = await this.stripe.refunds.create({
+            payment_intent: pi.id,
+            amount: amountMinor,
+            reason: "requested_by_customer",
+          });
+        } else {
+          this.logger.warn(
+            `[refund] could not determine refund amount for Stripe; skipping`
           );
         }
-
-        stripeRefund = await this.stripe.refunds.create({
-          payment_intent: pi.id,
-          amount: amountMinor,
-          reason: "requested_by_customer",
-        });
       } catch (e: any) {
         this.logger.error(
           `[refund] Stripe refund failed for ${orderId} / PI=${
             pi?.id ?? "?"
           }: ${e?.message ?? e}`
         );
-        // Kein Throw: Duffel ist bereits storniert – wir geben klaren Status zurück.
+        // kein Throw – Duffel ist schon storniert
       }
     } else {
       this.logger.warn(
@@ -660,7 +931,7 @@ export class PaymentsService {
         },
       });
 
-      // optional: Refund-Row persistieren
+      // optional: Refund row
       try {
         await this.prisma.refund.create({
           data: {
@@ -683,8 +954,8 @@ export class PaymentsService {
       this.logger.warn(`[refund] DB update failed for ${orderId}: ${e}`);
     }
 
-    return {
-      ok: true,
+    // 7) Freundliche Erfolgsmeldung
+    return this.resultOk({
       order_id: orderId,
       duffel_cancellation_id: duffelCancel?.id ?? null,
       stripe_refund_id: stripeRefund?.id ?? null,
@@ -693,7 +964,7 @@ export class PaymentsService {
           ? fromMinorUnits(amountMinor, refundCurrency)
           : dto.amount ?? dbOrder.amount ?? null,
       currency: refundCurrency,
-    };
+    });
   }
 
   // NEU: Stripe-only Partial Refund (keine Duffel-Interaktion)
@@ -703,18 +974,23 @@ export class PaymentsService {
   ) {
     const { amount, currency, reason } = body || {};
     if (!amount || !currency) {
-      throw new BadRequestException(
-        "amount and currency are required for partial refund"
+      return this.resultFail(
+        "missing_params",
+        "amount and currency are required for partial refund",
+        { amount, currency }
       );
     }
 
-    // PI finden (DB -> Search)
+    // 1) DB-Order holen
     const dbOrder = await this.prisma.order.findUnique({
       where: { duffelId: orderId },
       select: { id: true, paymentIntentId: true, currency: true },
     });
-    if (!dbOrder) throw new NotFoundException(`Order ${orderId} not found`);
+    if (!dbOrder) {
+      return this.resultFail("order_not_found", `Order ${orderId} not found`);
+    }
 
+    // 2) PaymentIntent ermitteln
     let pi: Stripe.PaymentIntent | undefined;
     if (dbOrder.paymentIntentId) {
       try {
@@ -722,52 +998,166 @@ export class PaymentsService {
       } catch {}
     }
     if (!pi) {
-      const res = await this.stripe.paymentIntents.search({
-        query: `metadata['duffel_order_id']:'${orderId}' AND status:'succeeded'`,
-        limit: 1,
-      });
-      pi = res.data?.[0];
+      try {
+        const res = await this.stripe.paymentIntents.search({
+          query: `metadata['duffel_order_id']:'${orderId}' AND status:'succeeded'`,
+          limit: 1,
+        });
+        pi = res.data?.[0];
+      } catch (e) {
+        this.logger.warn(`Stripe search PI failed for ${orderId}: ${e}`);
+      }
     }
     if (!pi) {
-      throw new NotFoundException(
+      return this.resultFail(
+        "pi_not_found",
         `No succeeded Stripe PaymentIntent found for order ${orderId}`
       );
     }
 
-    const cur = currency.toUpperCase();
-    const minor = toMinorUnits(amount, cur);
+    // 3) Währungs-Check: Refund muss in PI-Währung erfolgen
+    const piCurrency = (pi.currency || "").toUpperCase();
+    const reqCurrency = currency.toUpperCase();
+    if (!piCurrency) {
+      return this.resultFail(
+        "pi_currency_unknown",
+        "Could not determine PaymentIntent currency",
+        { payment_intent: pi.id }
+      );
+    }
+    if (reqCurrency !== piCurrency) {
+      return this.resultFail(
+        "currency_mismatch",
+        "Partial refund currency must equal the original charge currency",
+        { expected_currency: piCurrency, got: reqCurrency }
+      );
+    }
 
-    const r = await this.stripe.refunds.create({
-      payment_intent: pi.id,
-      amount: minor,
-      reason: "requested_by_customer",
-      metadata: { duffel_order_id: orderId, ...(reason ? { reason } : {}) },
-    });
-
-    // Optional: DB-Flag für Partial
+    // 4) Betrag validieren (minor units) & verfügbaren Rest prüfen
+    let minor: number;
     try {
-      await this.prisma.order.update({
-        where: { duffelId: orderId },
-        data: { paymentStatus: "partially_refunded" },
+      minor = toMinorUnits(amount, reqCurrency);
+    } catch {
+      return this.resultFail("invalid_amount", "Invalid amount format", {
+        amount,
+        currency: reqCurrency,
       });
-      await this.prisma.refund.create({
-        data: {
-          duffelId: `stripe_${r.id}`,
-          orderId: dbOrder.id,
-          amount,
-          currency: cur,
-          status: "succeeded",
+    }
+    if (minor <= 0) {
+      return this.resultFail(
+        "non_positive_amount",
+        "Refund amount must be greater than 0",
+        { minor }
+      );
+    }
+
+    // Verbleibender, noch erstattbarer Betrag ermitteln
+    let refundableMinor: number | undefined;
+    try {
+      const charges = await this.getChargesForPaymentIntent(pi.id);
+
+      // Falls trotzdem nichts: versuche latest_charge einzeln zu holen
+      if (
+        !charges.length &&
+        typeof pi.latest_charge === "string" &&
+        pi.latest_charge
+      ) {
+        try {
+          const ch = await this.stripe.charges.retrieve(pi.latest_charge);
+          if (ch) charges.push(ch as any);
+        } catch (e) {
+          this.logger.warn(
+            `[refundPartial] retrieve latest_charge failed for ${pi.latest_charge}: ${e}`
+          );
+        }
+      }
+
+      let captured = 0;
+      let refunded = 0;
+      for (const ch of charges) {
+        // Stripe-Charge Felder defensiv lesen
+        const cap =
+          typeof ch.amount_captured === "number"
+            ? ch.amount_captured
+            : typeof ch.amount === "number"
+            ? ch.amount
+            : 0;
+        const ref =
+          typeof ch.amount_refunded === "number" ? ch.amount_refunded : 0;
+        captured += cap;
+        refunded += ref;
+      }
+      refundableMinor = Math.max(0, captured - refunded);
+    } catch (e) {
+      this.logger.warn(
+        `[refundPartial] could not compute refundable amount for PI ${pi.id}: ${e}`
+      );
+    }
+
+    if (typeof refundableMinor === "number" && minor > refundableMinor) {
+      return this.resultFail(
+        "amount_exceeds_remaining",
+        "Refund amount exceeds remaining refundable balance",
+        {
+          requested_minor: minor,
+          remaining_minor: refundableMinor,
+          currency: reqCurrency,
+        }
+      );
+    }
+
+    // 5) Stripe Refund erstellen
+    try {
+      const refund = await this.stripe.refunds.create({
+        payment_intent: pi.id,
+        amount: minor,
+        reason: "requested_by_customer",
+        metadata: {
+          duffel_order_id: orderId,
+          ...(reason ? { reason } : {}),
         },
       });
-    } catch {}
 
-    return {
-      ok: true,
-      mode: "stripe_partial",
-      order_id: orderId,
-      stripe_refund_id: r.id,
-      amount,
-      currency: cur,
-    };
+      // 6) DB markieren (partial)
+      try {
+        await this.prisma.order.update({
+          where: { duffelId: orderId },
+          data: { paymentStatus: "partially_refunded" },
+        });
+        await this.prisma.refund.create({
+          data: {
+            duffelId: `stripe_${refund.id}`,
+            orderId: dbOrder.id,
+            amount, // als String gespeichert
+            currency: reqCurrency,
+            status: "succeeded",
+          },
+        });
+      } catch (e) {
+        this.logger.warn(
+          `[refundPartial] DB update failed for ${orderId}: ${e}`
+        );
+      }
+
+      return this.resultOk({
+        ok: true,
+        mode: "stripe_partial",
+        order_id: orderId,
+        stripe_refund_id: refund.id,
+        amount,
+        currency: reqCurrency,
+        remaining_after_minor:
+          typeof refundableMinor === "number"
+            ? Math.max(0, refundableMinor - minor)
+            : undefined,
+      });
+    } catch (e: any) {
+      const msg = e?.message ?? "Stripe refund failed";
+      this.logger.error(`[refundPartial] Stripe failed for ${orderId}: ${msg}`);
+      return this.resultFail("stripe_refund_failed", msg, {
+        order_id: orderId,
+        payment_intent: pi.id,
+      });
+    }
   }
 }
