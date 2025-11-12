@@ -3,6 +3,7 @@ import {
   Injectable,
   HttpException,
   BadRequestException,
+  ConflictException,
   Logger,
 } from "@nestjs/common";
 import { HttpService } from "@nestjs/axios";
@@ -18,7 +19,7 @@ import {
   ConfirmOrderChangeDto,
   ChangeSliceDto,
 } from "./dto/order-change.dto";
-
+import { createHash } from "crypto";
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
@@ -31,6 +32,66 @@ export class OrdersService {
   // -------- HELPERS --------
   private asDate(v?: string | null): Date | null {
     return v ? new Date(v) : null;
+  }
+
+  // private buildIdempotencyKey(dto: CreateOrderDto): string {
+  //   // Wir normalisieren nur die Felder, die kaufrelevant sind.
+  //   // Wichtig: KEIN timestamp hier, sonst wäre er wieder random.
+  //   const canonical = {
+  //     offerId: dto.offerId,
+  //     passengers: dto.passengers.map((p) => ({
+  //       id: p.id,
+  //       type: p.type,
+  //       title: p.title,
+  //       given_name: p.given_name,
+  //       family_name: p.family_name,
+  //       born_on: p.born_on,
+  //       gender: p.gender,
+  //       email: p.email,
+  //       phone_number: p.phone_number,
+  //     })),
+  //     payments: Array.isArray(dto.payments)
+  //       ? dto.payments.map((pay) => ({
+  //           type: pay.type,
+  //           currency: pay.currency,
+  //           amount: pay.amount,
+  //         }))
+  //       : [],
+  //   };
+
+  //   const raw = JSON.stringify(canonical);
+  //   return createHash("sha256").update(raw).digest("hex");
+  // }
+
+  private buildIdempotencyKey(dto: CreateOrderDto, userId: string): string {
+    const base = {
+      userId,
+      offerId: dto.offerId,
+      passengers: (dto.passengers || [])
+        .map((p) => ({
+          id: p.id,
+          type: p.type,
+          title: p.title,
+          given_name: p.given_name,
+          family_name: p.family_name,
+          born_on: p.born_on,
+          gender: p.gender,
+          email: p.email ?? null,
+          phone_number: p.phone_number ?? null,
+        }))
+        // Stabilisieren: nach id sortieren
+        .sort((a, b) => (a.id || "").localeCompare(b.id || "")),
+      payments: (dto.payments || [])
+        .map((x) => ({ type: x.type, currency: x.currency, amount: x.amount }))
+        .sort((a, b) =>
+          (a.type + a.currency + a.amount).localeCompare(
+            b.type + b.currency + b.amount
+          )
+        ),
+    };
+
+    const json = JSON.stringify(base);
+    return createHash("sha256").update(json).digest("hex");
   }
 
   private extractChangePolicy(order: any) {
@@ -246,134 +307,165 @@ export class OrdersService {
 
   // -------- CREATE ORDER (Duffel-konform, sofort persistieren) --------
   async create(dto: CreateOrderDto, currentUserId: string) {
-    const body = {
-      data: {
-        selected_offers: [dto.offerId],
-        passengers: dto.passengers.map((p) => ({
-          id: p.id,
-          type: p.type,
-          gender: p.gender,
-          title: p.title,
-          given_name: p.given_name,
-          family_name: p.family_name,
-          born_on: p.born_on,
-          email: p.email,
-          phone_number: p.phone_number,
-        })),
-        payments: dto.payments.map((pay) => ({
-          type: pay.type,
-          currency: pay.currency,
-          amount: pay.amount,
-        })),
-      },
+    // 1. Request-Body für Duffel aufbauen (payments nur senden wenn vorhanden)
+    const duffelPassengers = dto.passengers.map((p) => ({
+      id: p.id,
+      type: p.type,
+      gender: p.gender,
+      title: p.title,
+      given_name: p.given_name,
+      family_name: p.family_name,
+      born_on: p.born_on,
+      email: p.email,
+      phone_number: p.phone_number,
+    }));
+
+    const bodyData: any = {
+      selected_offers: [dto.offerId],
+      passengers: duffelPassengers,
     };
 
-    const idem = randomBytes(16).toString("hex");
+    if (Array.isArray(dto.payments) && dto.payments.length > 0) {
+      bodyData.payments = dto.payments.map((pay) => ({
+        type: pay.type,
+        currency: pay.currency,
+        amount: pay.amount,
+      }));
+    }
+    const body = { data: bodyData };
 
+    // 2. Stabiler Idempotency-Key
+    const idem = this.buildIdempotencyKey(dto, currentUserId);
+
+    // 3. Duffel call
+    let o: any;
     try {
       const { data } = await firstValueFrom(
         this.http.post("/orders", body, {
           headers: { "Idempotency-Key": idem },
         })
       );
-
-      const o = data?.data ?? data;
-      if (!o?.id)
-        throw new BadRequestException("Duffel did not return an order");
-
-      const orderType: "instant" | "hold" =
-        o?.type === "instant" || o?.type === "hold"
-          ? o.type
-          : o?.payment_status?.awaiting_payment
-          ? "hold"
-          : "instant";
-
-      // Log (klar und auffällig)
-      this.logger.log(
-        `Duffel order created: id=${
-          o.id
-        } type=${orderType} awaiting_payment=${!!o?.payment_status
-          ?.awaiting_payment} paid_at=${o?.payment_status?.paid_at ?? "null"}`
+      o = data?.data ?? data;
+    } catch (err: any) {
+      // Duffel hat selbst abgelehnt (422 z.B. "payments can't be blank")
+      // oder Preis expired, etc. => wir geben sauber zurück
+      throw new HttpException(
+        err?.response?.data ?? err?.message ?? "Unknown error",
+        err?.response?.status ?? 500
       );
+    }
 
-      // 1) Felder aus Duffel-Order abbilden (einfach & vollständig)
-      const resolvedStatus = this.resolveStatusFromDuffel(o);
+    if (!o?.id) {
+      throw new BadRequestException("Duffel did not return an order");
+    }
 
-      const dbData = {
-        duffelId: String(o.id),
-        offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
-        userId: currentUserId,
-        status: resolvedStatus,
-        amount: String(o.total_amount ?? "0"),
-        currency: String(o.total_currency ?? "USD"),
-        owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
-        liveMode: !!o.live_mode,
-        paymentStatus:
-          o?.payment_status?.awaiting_payment === true
-            ? "awaiting_payment"
-            : o?.payment_status?.paid_at
-            ? "succeeded"
-            : null,
-        paidAt: this.asDate(o?.payment_status?.paid_at),
-        awaitingPayment:
-          o?.payment_status?.awaiting_payment === true
-            ? true
-            : o?.payment_status?.awaiting_payment === false
-            ? false
-            : null,
-        paymentRequiredBy: this.asDate(o?.payment_status?.payment_required_by),
-        priceGuaranteeExpiresAt: this.asDate(
-          o?.payment_status?.price_guarantee_expires_at ??
-            o?.price_guarantee_expires_at
-        ),
-        bookingRef: o?.booking_reference ?? null,
-        documents: Array.isArray(o?.documents) ? (o.documents as any) : null,
-        segments: Array.isArray(o?.slices) ? (o.slices as any) : null,
-        passengers: Array.isArray(o?.passengers) ? (o.passengers as any) : null,
-        lastEventType: "order.created",
-      };
+    // 4. Status/Type sauber bestimmen
+    //    Achtung: Duffel sandbox lügt manchmal beim type,
+    //    deshalb fallback über payment_status.awaiting_payment
+    const awaitingPayment = o?.payment_status?.awaiting_payment === true;
+    const alreadyPaidAt = o?.payment_status?.paid_at ?? null;
 
-      // 2) Upsert der Order (sauber & vollständig)
+    const inferredType: "instant" | "hold" =
+      o?.type === "instant" || o?.type === "hold"
+        ? o.type
+        : awaitingPayment
+        ? "hold"
+        : "instant";
+
+    const resolvedStatus = this.resolveStatusFromDuffel(o);
+
+    // 5. DB upsert vorbereiten
+    const dbData = {
+      duffelId: String(o.id),
+      offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
+      userId: currentUserId,
+      status: resolvedStatus, // "confirmed", "awaiting_payment", ...
+      amount: String(o.total_amount ?? "0"),
+      currency: String(o.total_currency ?? "USD"),
+      owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
+      liveMode: !!o.live_mode,
+      paymentStatus: awaitingPayment
+        ? "awaiting_payment"
+        : alreadyPaidAt
+        ? "succeeded"
+        : null,
+      paidAt: this.asDate(alreadyPaidAt),
+      awaitingPayment: awaitingPayment
+        ? true
+        : o?.payment_status?.awaiting_payment === false
+        ? false
+        : null,
+      paymentRequiredBy: this.asDate(o?.payment_status?.payment_required_by),
+      priceGuaranteeExpiresAt: this.asDate(
+        o?.payment_status?.price_guarantee_expires_at ??
+          o?.price_guarantee_expires_at
+      ),
+      bookingRef: o?.booking_reference ?? null,
+      documents: Array.isArray(o?.documents) ? (o.documents as any) : null,
+      segments: Array.isArray(o?.slices) ? (o.slices as any) : null,
+      passengers: Array.isArray(o?.passengers) ? (o.passengers as any) : null,
+      lastEventType: "order.created",
+      // wir speichern auch den Idempotency-Key, damit wir später
+      // nachvollziehen können, was zusammengehört
+      idempotencyKey: idem as any,
+    };
+
+    // 6. DB persistieren (NICHT hart failen, damit wir keine Doppelbuchungs-Loop erzeugen)
+    try {
       await this.prisma.order.upsert({
         where: { duffelId: o.id },
         create: dbData as any,
         update: dbData as any,
       });
 
-      // 3) Sofort Tickets persistieren, falls bereits geliefert
+      // Falls Tickets schon mitgekommen sind -> dauerhaft speichern
       if (Array.isArray(o?.documents) && o.documents.length > 0) {
-        await this.persistTicketDocuments(o.id, o.documents);
+        await this.persistTicketDocuments(o.id, o.documents).catch((e) => {
+          this.logger.warn(
+            `persistTicketDocuments failed for ${o.id}: ${e?.message ?? e}`
+          );
+        });
       }
-
-      // (Optional) 4) Zusätzlich Poll (idempotent), falls Tickets async nachkommen
-      await this.eticketQueue
-        .add(
-          "poll",
-          { orderId: o.id, attempt: 1 },
-          {
-            jobId: `poll:${o.id}`,
-            delay: 3000,
-            removeOnComplete: true,
-            removeOnFail: true,
-          }
-        )
-        .catch(() => {});
-
-      // 5) API-Response simpel & wahr
-      return {
-        order_id: o.id,
-        status: resolvedStatus ?? "unknown",
-        total_amount: dbData.amount,
-        total_currency: dbData.currency,
-        owner: dbData.owner,
-        live_mode: !!dbData.liveMode,
-      };
-    } catch (err: any) {
-      throw new HttpException(
-        err?.response?.data ?? err?.message ?? "Unknown error",
-        err?.response?.status ?? 500
+    } catch (dbErr: any) {
+      // WICHTIG:
+      // Wir LOGGEN, aber werfen NICHT mehr hoch.
+      // Warum? Duffel Order IST JETZT REAL. Wenn wir 500 werfen,
+      // der Client drückt nochmal "Buchen" => neue Duffel Order, $$$ Problem.
+      this.logger.error(
+        `DB upsert failed for Duffel order ${o.id}: ${dbErr?.message ?? dbErr}`
       );
     }
+
+    // 7. eTicket-Poller trotzdem enqueuen (idempotent)
+    try {
+      await this.eticketQueue.add(
+        "poll",
+        { orderId: o.id, attempt: 1 },
+        {
+          jobId: `poll-${o.id}`, // verhindert Duplikate
+          delay: 3000,
+          removeOnComplete: true,
+          removeOnFail: true,
+        }
+      );
+    } catch (qErr) {
+      this.logger.warn(
+        `eticket-poll enqueue failed for ${o.id}: ${qErr as any}`
+      );
+    }
+
+    // 8. Klare API Antwort an den Client
+    return {
+      order_id: o.id,
+      status: resolvedStatus ?? "unknown",
+      order_type: inferredType, // "instant" oder "hold"
+      awaiting_payment: awaitingPayment,
+      paid_at: alreadyPaidAt ?? null,
+      total_amount: String(o.total_amount ?? "0"),
+      total_currency: String(o.total_currency ?? "USD"),
+      owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
+      live_mode: !!o.live_mode,
+    };
   }
 
   // ---- List my orders (from DB) ----

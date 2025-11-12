@@ -37,6 +37,12 @@ export class FlightsController {
     return this.flights.searchFlights(dto);
   }
 
+  // GET nur-hold-und-changeable via POST body → POST /flights/search/hold-changeable
+  @Post("search/hold-changeable")
+  searchHoldChangeable(@Body() dto: SearchFlightsDto) {
+    return this.flights.searchHoldChangeable(dto);
+  }
+
   @Get("offer-requests")
   list(
     @Query("after") after?: string,

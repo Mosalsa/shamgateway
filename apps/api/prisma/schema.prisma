@@ -57,6 +57,7 @@ model Order {
   scheduleChanges         OrderScheduleChange[] @relation("Order_ScheduleChanges")
   refunds                 Refund[]
   tickets                 TicketDocument[]      @relation("Order_TicketDocuments")
+  idempotencyKey          String?               @unique
 
   @@index([userId])
   @@index([duffelId])

@@ -1,5 +1,6 @@
 // apps/api/src/orders/dto/create-order.dto.ts
 import {
+  ArrayMinSize,
   IsArray,
   IsDateString,
   IsEmail,
@@ -41,14 +42,33 @@ export class PaymentDto {
   @IsString() amount!: string;
 }
 
+// export class CreateOrderDto {
+//   @IsString() offerId!: string;
+//   @IsArray()
+//   @ValidateNested({ each: true })
+//   @Type(() => PassengerDto)
+//   passengers!: PassengerDto[];
+//   @IsArray()
+//   @ValidateNested({ each: true })
+//   @Type(() => PaymentDto)
+//   payments!: PaymentDto[];
+// }
+
 export class CreateOrderDto {
-  @IsString() offerId!: string;
+  @IsString()
+  offerId!: string;
+
   @IsArray()
+  @ArrayMinSize(1)
   @ValidateNested({ each: true })
   @Type(() => PassengerDto)
   passengers!: PassengerDto[];
+
+  // nur erlauben, wenn wirklich Instant gezahlt werden soll
+  @IsOptional()
   @IsArray()
+  @ArrayMinSize(1)
   @ValidateNested({ each: true })
   @Type(() => PaymentDto)
-  payments!: PaymentDto[];
+  payments?: PaymentDto[];
 }

@@ -27,7 +27,7 @@ import { ConfigService } from "@nestjs/config";
             "Duffel-Version": version, // bei v2 passt das
             "Content-Type": "application/json",
           },
-          timeout: 15000,
+          timeout: Number(process.env.HTTP_TIMEOUT_MS ?? 45000),
           maxRedirects: 3,
         };
       },

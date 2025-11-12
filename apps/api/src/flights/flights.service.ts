@@ -4,10 +4,27 @@ import { Injectable, HttpException, BadRequestException } from "@nestjs/common";
 import { firstValueFrom } from "rxjs";
 import { CreateOfferRequestDto } from "./dto/create-offer-request.dto";
 import { SearchFlightsDto } from "./dto/search-flights.dto";
+const DEFAULT_SUPPLIER_TIMEOUT_MS = Number(
+  process.env.SUPPLIER_TIMEOUT_MS ?? 30000
+);
+const MIN_SUPPLIER_TIMEOUT_MS = 2000;
 
+type FilterMode =
+  | "hold_and_changeable"
+  | "hold_only"
+  | "changeable_only"
+  | "any";
 @Injectable()
 export class FlightsService {
   constructor(private readonly http: HttpService) {}
+
+  private resolveSupplierTimeoutMs(ms?: number) {
+    const v = Number.isFinite(ms as any)
+      ? Number(ms)
+      : DEFAULT_SUPPLIER_TIMEOUT_MS;
+    // Duffel fordert >= 2000 ms
+    return Math.max(v, MIN_SUPPLIER_TIMEOUT_MS);
+  }
 
   private makePassengers(dto: SearchFlightsDto) {
     const pax: any[] = [];
@@ -69,16 +86,21 @@ export class FlightsService {
       departure_date: s.departureDate,
     }));
   }
+
   async createOfferRequest(
     dto: CreateOfferRequestDto,
-    opts?: { return_offers?: boolean; supplier_timeout?: number }
+    opts?: { return_offers?: boolean; supplier_timeout?: number } // number in ms!
   ) {
-    const params: Record<string, any> = {};
-    if (typeof opts?.return_offers === "boolean")
-      params.return_offers = opts.return_offers;
-    if (typeof opts?.supplier_timeout === "number")
-      params.supplier_timeout = opts.supplier_timeout;
+    // 1) Params korrekt in MS bauen
+    const timeoutMs = this.resolveSupplierTimeoutMs(opts?.supplier_timeout);
+    const params: Record<string, any> = {
+      // default: true – stabilere Suche (kann per opts überschrieben werden)
+      return_offers:
+        typeof opts?.return_offers === "boolean" ? opts.return_offers : true,
+      supplier_timeout: timeoutMs,
+    };
 
+    // 2) Duffel-Body
     const body = {
       data: {
         slices: dto.slices,
@@ -90,11 +112,15 @@ export class FlightsService {
       },
     };
 
+    // 3) Call – wichtig: axios timeout > supplier_timeout
     try {
       const { data } = await firstValueFrom(
-        this.http.post("/offer_requests", body, { params })
+        this.http.post("/offer_requests", body, {
+          params,
+          timeout: timeoutMs + 5000, // client-Timeout > server aggregation
+        })
       );
-      return data?.data ?? data; // v2: payload hat "data"
+      return data?.data ?? data;
     } catch (err: any) {
       throw new HttpException(
         err?.response?.data ?? err?.message ?? "Unknown error",
@@ -102,6 +128,7 @@ export class FlightsService {
       );
     }
   }
+
   private applyAdvancedToBody(body: any, dto: SearchFlightsDto) {
     const adv = dto.advanced;
     if (!adv) return;
@@ -139,10 +166,14 @@ export class FlightsService {
     const body: any = { data: { slices, passengers } };
     if (dto.cabinClass) body.data.cabin_class = dto.cabinClass;
     this.applyAdvancedToBody(body, dto);
-
+    const SUPPLIER_TIMEOUT_MS = Number(
+      process.env.SUPPLIER_TIMEOUT_MS ?? 30000
+    );
     // Duffel v2: POST /air/offer_requests
     const { data: created } = await firstValueFrom(
-      this.http.post("/offer_requests", body)
+      this.http.post("/offer_requests", body, {
+        params: { return_offers: true, supplier_timeout: 30000 },
+      })
     );
     const offerRequest = created?.data ?? created;
 
@@ -176,6 +207,186 @@ export class FlightsService {
       samples,
       note: "Klassifikation basiert auf offer.payment_requirements.requires_instant_payment bzw. payment_required_by.",
       offers, // ← wenn zu groß, hier entfernen oder mit ?details=1 steuern
+    };
+  }
+
+  // In FlightsService einfügen:
+  async searchHoldChangeable(
+    dto: SearchFlightsDto,
+    mode: FilterMode = "hold_and_changeable"
+  ) {
+    // --- Helfer: Passengers aus adults/children/infants bauen (Duffel erwartet Liste)
+    const buildPassengers = () => {
+      const list: Array<{ type: "adult" | "child" | "infant_without_seat" }> =
+        [];
+      const adults = Math.max(1, Number(dto.adults ?? 1));
+      const children = Math.max(0, Number(dto.children ?? 0));
+      const infants = Math.max(0, Number(dto.infants ?? 0));
+      for (let i = 0; i < adults; i++) list.push({ type: "adult" });
+      for (let i = 0; i < children; i++) list.push({ type: "child" });
+      for (let i = 0; i < infants; i++)
+        list.push({ type: "infant_without_seat" });
+      return list;
+    };
+
+    // --- Helfer: Slices aus deinem DTO (one_way/return/multi_city)
+    const buildSlices = () => {
+      const out: Array<{
+        origin: string;
+        destination: string;
+        departure_date: string;
+      }> = [];
+      if (dto.journeyType === "one_way") {
+        if (!dto.origin || !dto.destination || !dto.departureDate) {
+          throw new BadRequestException(
+            "origin, destination, departureDate sind erforderlich (one_way)"
+          );
+        }
+        out.push({
+          origin: dto.origin,
+          destination: dto.destination,
+          departure_date: dto.departureDate,
+        });
+      } else if (dto.journeyType === "return") {
+        if (
+          !dto.origin ||
+          !dto.destination ||
+          !dto.departureDate ||
+          !dto.returnDate
+        ) {
+          throw new BadRequestException(
+            "origin, destination, departureDate, returnDate sind erforderlich (return)"
+          );
+        }
+        out.push({
+          origin: dto.origin,
+          destination: dto.destination,
+          departure_date: dto.departureDate,
+        });
+        out.push({
+          origin: dto.destination,
+          destination: dto.origin,
+          departure_date: dto.returnDate,
+        });
+      } else {
+        const arr = Array.isArray(dto.slices) ? dto.slices : [];
+        if (arr.length < 2)
+          throw new BadRequestException(
+            "multi_city benötigt mindestens 2 Slices"
+          );
+        for (const s of arr) {
+          if (!s.origin || !s.destination || !s.departureDate) {
+            throw new BadRequestException(
+              "Slice benötigt origin, destination, departureDate (YYYY-MM-DD)"
+            );
+          }
+          out.push({
+            origin: s.origin,
+            destination: s.destination,
+            departure_date: s.departureDate,
+          });
+        }
+      }
+      return out;
+    };
+
+    // ---- Duffel Request (wie deine search), KEINE Carrier erzwungen
+    const body: any = {
+      data: {
+        slices: buildSlices(),
+        passengers: buildPassengers(),
+        ...(dto.cabinClass ? { cabin_class: dto.cabinClass } : {}),
+        ...(typeof dto.advanced?.maxConnections === "number"
+          ? { max_connections: dto.advanced.maxConnections }
+          : {}),
+        ...(Array.isArray(dto.advanced?.allowCarriers) &&
+        dto.advanced.allowCarriers.length
+          ? { allowed_carriers: dto.advanced.allowCarriers }
+          : {}),
+        ...(Array.isArray(dto.advanced?.blockCarriers) &&
+        dto.advanced.blockCarriers.length
+          ? { blocked_carriers: dto.advanced.blockCarriers }
+          : {}),
+      },
+    };
+
+    const params = {
+      return_offers: true,
+      supplier_timeout: 30000, // Duffel verlangt >= 2000 (ms)
+    };
+
+    const { data } = await firstValueFrom(
+      this.http.post("/offer_requests", body, { params })
+    );
+    const payload = data?.data ?? data;
+
+    // v2: Offers herausziehen
+    const offers: any[] =
+      (Array.isArray(payload?.offers) && payload.offers) ||
+      (Array.isArray(payload?.data) && payload.data) ||
+      (Array.isArray(payload) ? payload : []);
+
+    // --- Filterlogik + Diagnose
+    const reasons = {
+      instantOnly: 0,
+      notChangeableTop: 0,
+      notChangeableSlice: 0,
+    };
+
+    const passHold = (o: any) =>
+      o?.payment_requirements?.requires_instant_payment === false;
+    const passTopChange = (o: any) =>
+      !!o?.conditions?.change_before_departure?.allowed;
+    const passAllSlicesChange = (o: any) => {
+      const ss = Array.isArray(o?.slices) ? o.slices : [];
+      return ss.every(
+        (s: any) => !!s?.conditions?.change_before_departure?.allowed
+      );
+    };
+
+    const keep = (o: any) => {
+      switch (mode) {
+        case "hold_only":
+          return passHold(o);
+        case "changeable_only":
+          return passTopChange(o) && passAllSlicesChange(o);
+        case "any":
+          return true;
+        default:
+          /* hold_and_changeable */ return (
+            passHold(o) && passTopChange(o) && passAllSlicesChange(o)
+          );
+      }
+    };
+
+    const filtered: any[] = [];
+    for (const off of offers) {
+      // Für Breakdown immer erst streng zählen (wie du es debuggen willst)
+      const isHold = passHold(off);
+      const isTopChg = passTopChange(off);
+      const isSlicesChg = passAllSlicesChange(off);
+      if (!isHold) reasons.instantOnly++;
+      else if (!isTopChg) reasons.notChangeableTop++;
+      else if (!isSlicesChg) reasons.notChangeableSlice++;
+
+      if (keep(off)) filtered.push(off);
+    }
+
+    // Preis-aufsteigend
+    filtered.sort(
+      (a, b) => Number(a?.total_amount ?? 0) - Number(b?.total_amount ?? 0)
+    );
+
+    // Gleiche Struktur behalten, nur offers ersetzen + Stats anhängen
+    return {
+      ...payload,
+      offers: filtered,
+      _stats: {
+        total: Array.isArray(offers) ? offers.length : 0,
+        filtered: filtered.length,
+        reasons, // hilft sofort zu sehen, warum nichts übrig blieb
+        mode,
+      },
     };
   }
 
@@ -305,12 +516,13 @@ export class FlightsService {
   // POST /air/batch_offer_requests
   async createBatchOfferRequest(
     dto: CreateOfferRequestDto,
-    opts?: { supplier_timeout?: number }
+    opts?: { supplier_timeout?: number } // number in ms!
   ) {
-    const params: Record<string, any> = {};
-    if (typeof opts?.supplier_timeout === "number") {
-      params.supplier_timeout = opts.supplier_timeout;
-    }
+    const timeoutMs = this.resolveSupplierTimeoutMs(opts?.supplier_timeout);
+    const params: Record<string, any> = {
+      supplier_timeout: timeoutMs,
+    };
+
     const body = {
       data: {
         slices: dto.slices,
@@ -321,14 +533,18 @@ export class FlightsService {
           : {}),
       },
     };
+
     try {
       const { data } = await firstValueFrom(
-        this.http.post(`/batch_offer_requests`, body, { params })
+        this.http.post("/batch_offer_requests", body, {
+          params,
+          timeout: timeoutMs + 5000,
+        })
       );
       return data?.data ?? data;
     } catch (err: any) {
       throw new HttpException(
-        err?.response?.data ?? err,
+        err?.response?.data ?? err?.message ?? "Unknown error",
         err?.response?.status ?? 500
       );
     }
