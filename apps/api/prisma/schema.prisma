@@ -8,21 +8,24 @@ datasource db {
 }
 
 model User {
-  id                   String    @id @default(uuid())
-  email                String    @unique
+  id                   String         @id @default(uuid())
+  email                String         @unique
   password             String
   firstName            String?
   lastName             String?
   birthDate            DateTime?
-  role                 UserRole  @default(CUSTOMER)
-  isVerified           Boolean   @default(false)
+  role                 UserRole       @default(CUSTOMER)
+  isVerified           Boolean        @default(false)
   verificationToken    String?
   refreshToken         String?
   resetPasswordToken   String?
   resetPasswordExpires DateTime?
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
   orders               Order[]
+  courierSent          CourierOrder[] @relation("CourierSender")
+  courierReceived      CourierOrder[] @relation("CourierRecipient")
+  TravelOrder          TravelOrder[]
 
   @@index([email])
 }
@@ -58,6 +61,7 @@ model Order {
   refunds                 Refund[]
   tickets                 TicketDocument[]      @relation("Order_TicketDocuments")
   idempotencyKey          String?               @unique
+  TravelOrder             TravelOrder[]
 
   @@index([userId])
   @@index([duffelId])
@@ -190,6 +194,172 @@ model OrderChange {
   updatedAt DateTime @updatedAt
 }
 
+model TransportProvider {
+  id           String           @id @default(cuid())
+  name         String
+  legalName    String?
+  email        String?
+  phone        String?
+  iban         String?
+  bankName     String?
+  address      Json?
+  baseCurrency String           @default("USD")
+  vehicleCount Int              @default(0)
+  vehicleTypes String[]
+  active       Boolean          @default(true)
+  routes       TransportRoute[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([active])
+}
+
+model TransportRoute {
+  id            String                 @id @default(cuid())
+  providerId    String
+  provider      TransportProvider      @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  fromAirport   String
+  toRegion      String
+  baseKm        Int
+  leadTimeHours Int
+  minPax        Int                    @default(1)
+  maxPax        Int                    @default(6)
+  priceModel    Json // { base_fixed, per_km, per_pax, per_bag }
+  cancelPolicy  Json?
+  active        Boolean                @default(true)
+  orders        GroundTransportOrder[]
+
+  @@index([providerId])
+  @@index([fromAirport, toRegion])
+  @@index([active])
+}
+
+model GroundTransportOrder {
+  id               String                @id @default(cuid())
+  travelOrderId    String // nur Referenz (TravelOrder bauen wir später)
+  providerId       String
+  routeId          String
+  status           GroundTransportStatus @default(reserved)
+  reserveId        String?
+  paxCount         Int
+  bagsCount        Int
+  fromAirport      String
+  toRegion         String
+  dateTimeUTC      DateTime
+  amountUSD        String
+  currency         String                @default("USD")
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+  TransportRoute   TransportRoute?       @relation(fields: [transportRouteId], references: [id])
+  transportRouteId String?
+  TravelOrder      TravelOrder[]
+  confirmedAt DateTime?
+  cancelledAt DateTime?
+
+  @@index([travelOrderId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model CourierOrder {
+  id String @id @default(cuid())
+
+  // RELATIONS
+  senderId String
+  sender   User   @relation("CourierSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  recipientId String
+  recipient   User   @relation("CourierRecipient", fields: [recipientId], references: [id], onDelete: Restrict)
+
+  // OPTIONAL LINK zur Reise des Empfängers (falls vorhanden)
+  recipientTravelOrderId String? // TravelOrder-ID als String (Container bauen wir später)
+
+  // SNAPSHOTS (für Label/Zustellung; optional, können leer sein – werden beim Erstellen vorausgefüllt)
+  recipientName  String?
+  recipientPhone String?
+  recipientCity  String?
+
+  // ROUTE & INHALT
+  routeFrom     String
+  routeTo       String
+  desiredDate   DateTime
+  itemType      String // 'documents' | 'small_parcel'
+  weightKg      Float    @default(0)
+  declaredValue String?
+  notes         String?
+
+  // STATUS & ZAHLUNG
+  status   CourierOrderStatus @default(draft)
+  price    String             @default("0.00")
+  currency String
+  escrowId String?
+
+  // CHILDREN
+  items   ShipmentItem[]
+  matches CourierMatch[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([senderId])
+  @@index([recipientId])
+  @@index([status])
+  @@index([routeFrom, routeTo])
+  @@index([desiredDate])
+  @@index([recipientTravelOrderId])
+}
+
+model ShipmentItem {
+  id             String       @id @default(cuid())
+  courierOrderId String
+  order          CourierOrder @relation(fields: [courierOrderId], references: [id], onDelete: Cascade)
+  title          String
+  description    String?
+  fileIds        String[]
+  quantity       Int          @default(1)
+  fee            String       @default("0.00")
+  currency       String
+
+  @@index([courierOrderId])
+}
+
+model CourierTrip {
+  id          String         @id @default(cuid())
+  userId      String
+  routeFrom   String
+  routeTo     String
+  date        DateTime
+  maxWeightKg Float
+  status      String         @default("open")
+  matches     CourierMatch[]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  TravelOrder TravelOrder[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([routeFrom, routeTo])
+  @@index([date])
+}
+
+model CourierMatch {
+  id             String             @id @default(cuid())
+  courierOrderId String
+  tripId         String
+  order          CourierOrder       @relation(fields: [courierOrderId], references: [id], onDelete: Cascade)
+  trip           CourierTrip        @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  status         CourierMatchStatus @default(proposed)
+  price          String
+  currency       String
+  escrowId       String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  @@index([courierOrderId])
+  @@index([tripId])
+  @@index([status])
+}
+
 enum Role {
   USER
   STAFF
@@ -207,4 +377,132 @@ enum UserRole {
   CUSTOMER
   ADMIN
   STAFF
+}
+
+enum GroundTransportStatus {
+  none
+  reserved
+  confirmed
+  cancelled
+}
+
+enum CourierOrderStatus {
+  draft
+  open
+  matched
+  in_transit
+  delivered
+  cancelled
+}
+
+enum CourierMatchStatus {
+  proposed
+  accepted
+  funded
+  in_transit
+  delivered
+  cancelled
+}
+
+// === Pricing: Enums ===
+enum FeePolicyKind {
+  service // deine Marge
+  card // Karten-/Stripe-Gebühr
+  shamcash // ShamCash-Gebühr
+  vat // Steuer/VAT-Policy
+}
+
+enum TravelOrderStatus {
+  created
+  awaiting_payment
+  paid
+  expired
+  cancelled
+  fulfilled
+}
+
+model TravelOrder {
+  id String @id @default(cuid())
+
+  // Owner
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Components (optional bis zur Bestätigung)
+  flightOrderId String?
+  flightOrder   Order?  @relation(fields: [flightOrderId], references: [id], onDelete: SetNull)
+
+  groundTransportOrderId String?
+  groundTransportOrder   GroundTransportOrder? @relation(fields: [groundTransportOrderId], references: [id], onDelete: SetNull)
+
+  courierTripId String?
+  courierTrip   CourierTrip? @relation(fields: [courierTripId], references: [id], onDelete: SetNull)
+
+  // Pricing & Payment
+  currency    String // z. B. "EUR"
+  totalAmount Decimal           @db.Decimal(12, 2) // Gesamtsumme (Flight+Ground+Fees+Tax)
+  status      TravelOrderStatus @default(created)
+
+  paymentIntentId String?   @unique // Stripe PI (kind=travel_order)
+  paymentMethod   String? // "card" | "shamcash"
+  paidAt          DateTime?
+  holdExpiresAt   DateTime? // aus Duffel paymentRequiredBy
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Back-relation: PriceQuotes hängen sich hier ran
+  priceQuotes PriceQuote[]
+
+  @@index([userId])
+  @@index([flightOrderId])
+  @@index([groundTransportOrderId])
+  @@index([status])
+}
+
+// === Pricing: Wechselkurse ===
+model FxRate {
+  id        String   @id @default(cuid())
+  base      String // z.B. "EUR"
+  quote     String // z.B. "SYP" | "USD"
+  rate      Decimal  @db.Decimal(18, 8) // 1 base = rate quote
+  source    String? // "manual", "ECB", ...
+  updatedAt DateTime @updatedAt
+
+  @@unique([base, quote], map: "fxrate_base_quote_unique")
+}
+
+// === Pricing: Gebühren-Policies ===
+model FeePolicy {
+  id             String        @id @default(cuid())
+  kind           FeePolicyKind
+  name           String
+  percent        Decimal       @default(0) @db.Decimal(8, 4) // z.B. 1.4000 = 1.4%
+  fixed          Decimal       @default(0) @db.Decimal(12, 2) // in policyCurrency
+  policyCurrency String // "EUR" (Empfehlung)
+  active         Boolean       @default(true)
+  meta           Json?
+  updatedAt      DateTime      @updatedAt
+
+  @@index([kind, active], map: "feepolicy_kind_active_idx")
+}
+
+model PriceQuote {
+  id String @id @default(cuid())
+
+  travelOrderId String?
+  travelOrder   TravelOrder? @relation(fields: [travelOrderId], references: [id], onDelete: SetNull)
+
+  currency   String
+  breakdown  Json
+  subtotal   Decimal @db.Decimal(12, 2)
+  paymentFee Decimal @db.Decimal(12, 2)
+  tax        Decimal @db.Decimal(12, 2)
+  total      Decimal @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([currency, createdAt], map: "pricequote_currency_created_idx")
+  @@index([travelOrderId], map: "pricequote_travelorder_idx")
 }
