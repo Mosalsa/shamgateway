@@ -307,37 +307,126 @@ export class OrdersService {
 
   // -------- CREATE ORDER (Duffel-konform, sofort persistieren) --------
   async create(dto: CreateOrderDto, currentUserId: string) {
-    // 1. Request-Body für Duffel aufbauen (payments nur senden wenn vorhanden)
+    // --- 0) Vorab-Checks ---
+    if (!dto?.offerId) {
+      throw new BadRequestException({
+        code: "missing_offer_id",
+        message: "offerId is required",
+      });
+    }
+    if (!Array.isArray(dto?.passengers) || dto.passengers.length === 0) {
+      throw new BadRequestException({
+        code: "missing_passengers",
+        message: "At least one passenger is required",
+      });
+    }
+
+    // --- 1) Passengers für Duffel (nur erlaubte Felder) ---
     const duffelPassengers = dto.passengers.map((p) => ({
       id: p.id,
-      type: p.type,
-      gender: p.gender,
-      title: p.title,
+      type: p.type, // "adult" | "child" | ...
+      gender: p.gender, // "m" | "f" | "x"
+      title: p.title, // "mr" | "ms" | ...
       given_name: p.given_name,
       family_name: p.family_name,
-      born_on: p.born_on,
+      born_on: p.born_on, // "YYYY-MM-DD"
       email: p.email,
-      phone_number: p.phone_number,
+      phone_number: p.phone_number, // E.164
     }));
 
+    // --- 2) Offer einlesen + Fähigkeiten/Policies ermitteln ---
+    const { data: offerResp } = await firstValueFrom(
+      this.http.get(`/offers/${dto.offerId}`)
+    );
+    const offer = offerResp?.data ?? offerResp;
+
+    if (!offer?.id) {
+      throw new BadRequestException({
+        code: "offer_not_found",
+        message: "Offer could not be loaded",
+        offer_id: dto.offerId,
+      });
+    }
+
+    const pr = offer?.payment_requirements ?? {};
+    const requiresInstant = pr?.requires_instant_payment === true;
+
+    // strikte Hold-Fähigkeit: Nur wenn Duffel uns eine Deadline nennt, kann man „hold“ machen
+    const supportsHold = !requiresInstant && !!pr?.payment_required_by;
+
+    // deine Changeability-Policy (Top + Slice) bleibt bestehen
+    const policy = this.extractChangePolicy({
+      conditions: offer?.conditions,
+      slices: offer?.slices,
+    });
+    const isChangeable = !!policy?.allowed;
+
+    // --- 3) Intent bestimmen + Guards ---
+    const hasPayments = Array.isArray(dto.payments) && dto.payments.length > 0;
+    const wantsHold = !hasPayments; // Keine payments => Kunde beabsichtigt Hold
+
+    // Wenn Kunde Hold will, Offer aber nicht hold-fähig => sauber ablehnen
+    if (wantsHold && !supportsHold) {
+      throw new BadRequestException({
+        code: "offer_not_holdable",
+        message:
+          "Dieses Angebot kann nicht auf 'Hold' gesetzt werden. Bitte ein hold-fähiges Angebot wählen.",
+        offer_id: dto.offerId,
+      });
+    }
+
+    // Wenn Kunde Instant will (payments geschickt), aber payments leer/fehlerhaft => ablehnen
+    if (!wantsHold) {
+      // payments müssen vollständig sein (type/currency/amount)
+      for (const pay of dto.payments!) {
+        if (!pay?.type || !pay?.currency || pay?.amount == null) {
+          throw new BadRequestException({
+            code: "instant_missing_payments",
+            message:
+              "Für 'instant' Bestellungen müssen gültige Zahlungen (type, currency, amount) mitgesendet werden.",
+            offer_id: dto.offerId,
+          });
+        }
+      }
+    }
+
+    // Optionaler Business-Guard (wie zuvor): wir verlangen explizit changeable
+    if (!isChangeable) {
+      throw new BadRequestException({
+        code: "offer_not_changeable",
+        message:
+          "Dieses Angebot ist nicht änderbar. Bitte ein 'changeable' Angebot wählen.",
+        offer_id: dto.offerId,
+      });
+    }
+
+    // --- 4) Duffel-Body (type IMMER setzen; payments NUR bei instant senden) ---
+    const paymentsPayload = !wantsHold
+      ? dto.payments!.map((pay) => ({
+          type: pay.type, // z.B. "balance"
+          currency: String(pay.currency).toUpperCase(),
+          amount: String(pay.amount),
+        }))
+      : undefined;
+
     const bodyData: any = {
+      type: wantsHold ? "hold" : "instant",
       selected_offers: [dto.offerId],
       passengers: duffelPassengers,
     };
-
-    if (Array.isArray(dto.payments) && dto.payments.length > 0) {
-      bodyData.payments = dto.payments.map((pay) => ({
-        type: pay.type,
-        currency: pay.currency,
-        amount: pay.amount,
-      }));
+    if (paymentsPayload) {
+      bodyData.payments = paymentsPayload; // nur bei instant; NIE leeres Array
     }
     const body = { data: bodyData };
 
-    // 2. Stabiler Idempotency-Key
-    const idem = this.buildIdempotencyKey(dto, currentUserId);
+    // --- 5) Robuster Idempotency-Key (an das finale Payload gebunden) ---
+    const idem = this.buildRobustIdempotencyKey(
+      currentUserId,
+      dto.offerId,
+      bodyData
+    );
 
-    // 3. Duffel call
+    // --- 6) Duffel call ---
     let o: any;
     try {
       const { data } = await firstValueFrom(
@@ -347,8 +436,6 @@ export class OrdersService {
       );
       o = data?.data ?? data;
     } catch (err: any) {
-      // Duffel hat selbst abgelehnt (422 z.B. "payments can't be blank")
-      // oder Preis expired, etc. => wir geben sauber zurück
       throw new HttpException(
         err?.response?.data ?? err?.message ?? "Unknown error",
         err?.response?.status ?? 500
@@ -359,9 +446,7 @@ export class OrdersService {
       throw new BadRequestException("Duffel did not return an order");
     }
 
-    // 4. Status/Type sauber bestimmen
-    //    Achtung: Duffel sandbox lügt manchmal beim type,
-    //    deshalb fallback über payment_status.awaiting_payment
+    // --- 7) Status/Type robust bestimmen (Sandbox kann beim type irren) ---
     const awaitingPayment = o?.payment_status?.awaiting_payment === true;
     const alreadyPaidAt = o?.payment_status?.paid_at ?? null;
 
@@ -374,12 +459,12 @@ export class OrdersService {
 
     const resolvedStatus = this.resolveStatusFromDuffel(o);
 
-    // 5. DB upsert vorbereiten
+    // --- 8) DB upsert (nie hart failen, um Doppelbuchungen zu vermeiden) ---
     const dbData = {
       duffelId: String(o.id),
       offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
       userId: currentUserId,
-      status: resolvedStatus, // "confirmed", "awaiting_payment", ...
+      status: resolvedStatus,
       amount: String(o.total_amount ?? "0"),
       currency: String(o.total_currency ?? "USD"),
       owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
@@ -405,12 +490,9 @@ export class OrdersService {
       segments: Array.isArray(o?.slices) ? (o.slices as any) : null,
       passengers: Array.isArray(o?.passengers) ? (o.passengers as any) : null,
       lastEventType: "order.created",
-      // wir speichern auch den Idempotency-Key, damit wir später
-      // nachvollziehen können, was zusammengehört
       idempotencyKey: idem as any,
     };
 
-    // 6. DB persistieren (NICHT hart failen, damit wir keine Doppelbuchungs-Loop erzeugen)
     try {
       await this.prisma.order.upsert({
         where: { duffelId: o.id },
@@ -418,7 +500,6 @@ export class OrdersService {
         update: dbData as any,
       });
 
-      // Falls Tickets schon mitgekommen sind -> dauerhaft speichern
       if (Array.isArray(o?.documents) && o.documents.length > 0) {
         await this.persistTicketDocuments(o.id, o.documents).catch((e) => {
           this.logger.warn(
@@ -427,22 +508,19 @@ export class OrdersService {
         });
       }
     } catch (dbErr: any) {
-      // WICHTIG:
-      // Wir LOGGEN, aber werfen NICHT mehr hoch.
-      // Warum? Duffel Order IST JETZT REAL. Wenn wir 500 werfen,
-      // der Client drückt nochmal "Buchen" => neue Duffel Order, $$$ Problem.
       this.logger.error(
         `DB upsert failed for Duffel order ${o.id}: ${dbErr?.message ?? dbErr}`
       );
+      // absichtlich kein throw, Order existiert bereits bei Duffel
     }
 
-    // 7. eTicket-Poller trotzdem enqueuen (idempotent)
+    // --- 9) eTicket-Poller (idempotent enqueue) ---
     try {
       await this.eticketQueue.add(
         "poll",
         { orderId: o.id, attempt: 1 },
         {
-          jobId: `poll-${o.id}`, // verhindert Duplikate
+          jobId: `poll-${o.id}`,
           delay: 3000,
           removeOnComplete: true,
           removeOnFail: true,
@@ -454,11 +532,11 @@ export class OrdersService {
       );
     }
 
-    // 8. Klare API Antwort an den Client
+    // --- 10) Klare Antwort ---
     return {
       order_id: o.id,
       status: resolvedStatus ?? "unknown",
-      order_type: inferredType, // "instant" oder "hold"
+      order_type: inferredType, // "instant" | "hold"
       awaiting_payment: awaitingPayment,
       paid_at: alreadyPaidAt ?? null,
       total_amount: String(o.total_amount ?? "0"),
@@ -466,6 +544,21 @@ export class OrdersService {
       owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
       live_mode: !!o.live_mode,
     };
+  }
+
+  /** Robuster Idempotency-Key, der an das finale Payload (data) gebunden ist */
+  private buildRobustIdempotencyKey(
+    userId: string,
+    offerId: string,
+    data: any
+  ): string {
+    // deterministische String-Repräsentation (Keys bereits deterministisch gesetzt)
+    const json = JSON.stringify(data);
+    const hash = require("crypto")
+      .createHash("sha256")
+      .update(json)
+      .digest("hex");
+    return `order:${userId}:${offerId}:${hash}`;
   }
 
   // ---- List my orders (from DB) ----
