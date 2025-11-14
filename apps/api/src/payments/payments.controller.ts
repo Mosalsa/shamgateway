@@ -65,11 +65,4 @@ export class PaymentsController {
   ) {
     return this.payments.refundStripePartial(orderId, body);
   }
-
-  @Post("intents/travel/:travelOrderId")
-  @HttpCode(200)
-  createIntentForTravelOrder(@Param("travelOrderId") travelOrderId: string) {
-    // Optional: userId aus Auth (req.user?.id) – hier erstmal ohne
-    return this.payments.createIntentForTravelOrder(travelOrderId);
-  }
 }

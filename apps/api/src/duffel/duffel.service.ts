@@ -24,9 +24,42 @@ export class DuffelService {
     }
   }
 
+  // async createPayment(params: {
+  //   order_id: string;
+  //   amount: string; // "156.42"
+  //   currency: string; // "EUR"
+  //   idempotencyKey: string;
+  // }) {
+  //   try {
+  //     const { data } = await firstValueFrom(
+  //       this.http.post(
+  //         `/payments`,
+  //         {
+  //           data: {
+  //             order_id: params.order_id,
+  //             amount: params.amount,
+  //             currency: params.currency.toUpperCase(),
+  //           },
+  //         },
+  //         { headers: { "Idempotency-Key": params.idempotencyKey } }
+  //       )
+  //     );
+  //     return data?.data ?? data;
+  //   } catch (e: any) {
+  //     if (e?.response?.status === 400) {
+  //       throw new BadRequestException(e?.response?.data ?? "Duffel 400");
+  //     }
+  //     throw new InternalServerErrorException(
+  //       `Duffel payment failed: ${e?.message ?? "unknown"}`
+  //     );
+  //   }
+  // }
+
+  // apps/api/src/duffel/duffel.service.ts
+
   async createPayment(params: {
     order_id: string;
-    amount: string; // "156.42"
+    amount: string; // "150.54"
     currency: string; // "EUR"
     idempotencyKey: string;
   }) {
@@ -37,8 +70,11 @@ export class DuffelService {
           {
             data: {
               order_id: params.order_id,
-              amount: params.amount,
-              currency: params.currency.toUpperCase(),
+              payment: {
+                type: "balance", // Duffel-Payment-Typ
+                amount: params.amount, // z.B. "150.54"
+                currency: params.currency.toUpperCase(), // "EUR"
+              },
             },
           },
           { headers: { "Idempotency-Key": params.idempotencyKey } }
@@ -46,15 +82,26 @@ export class DuffelService {
       );
       return data?.data ?? data;
     } catch (e: any) {
-      if (e?.response?.status === 400) {
-        throw new BadRequestException(e?.response?.data ?? "Duffel 400");
+      const status = e?.response?.status;
+      const body = e?.response?.data;
+
+      // fürs Debugging: hier siehst du die echten Duffel-Fehler
+      console.error(
+        "Duffel /payments error:",
+        status,
+        typeof body === "object" ? JSON.stringify(body) : body
+      );
+
+      if (status === 400 || status === 422) {
+        // Validierungsfehler: direkt so nach außen geben
+        throw new BadRequestException(body ?? "Duffel validation error");
       }
+
       throw new InternalServerErrorException(
         `Duffel payment failed: ${e?.message ?? "unknown"}`
       );
     }
   }
-  // apps/api/src/duffel/duffel.service.ts
 
   // --- Order Cancellation: create quote ---
   async createOrderCancellation(input: { order_id: string; reason?: string }) {

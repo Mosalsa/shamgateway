@@ -8,8 +8,6 @@ import { OrdersModule } from "./orders/orders.module"; // falls vorhanden
 import { PaymentsModule } from "./payments/payments.module";
 import { DuffelWebhookModule } from "./webhooks/duffel-webhook.module";
 import { BullModule } from "@nestjs/bullmq";
-import { TransportModule } from "./transport/transport.module";
-import { CourierModule } from "./courier/courier.module";
 
 @Module({
   imports: [
@@ -29,8 +27,6 @@ import { CourierModule } from "./courier/courier.module";
     FlightsModule,
     OrdersModule,
     PaymentsModule,
-    TransportModule,
-    CourierModule,
   ],
 })
 export class AppModule {}

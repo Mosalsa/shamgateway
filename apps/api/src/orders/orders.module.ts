@@ -1,19 +1,12 @@
 // apps/api/src/orders/orders.module.ts
-import { Module } from "@nestjs/common";
 import { BullModule } from "@nestjs/bullmq";
-import { OrdersController } from "./orders.controller";
-import { TravelOrderController } from "./travel-order.controller";
-import { TravelOrderService } from "./travel-order.service";
-import { OrdersService } from "./orders.service";
-import { EticketPollProcessor } from "../tickets/eticket-poll.processor";
-import { DuffelHttpModule } from "../common/duffel-http.module";
+import { Module } from "@nestjs/common";
 import { PrismaModule } from "../../prisma/prisma.module";
+import { DuffelHttpModule } from "../common/duffel-http.module";
 import { PaymentsModule } from "../payments/payments.module";
-import { DuffelAdapter } from "./duffel.adapter";
-import { PaymentsAdapter } from "./payments.adapter";
-import { SimplePriceBuilder } from "./price-builder.service";
-import { RepoPrismaAdapter } from "./repo-prisma.adapter";
-import { TicketsQueueBull } from "./tickets.queue";
+import { EticketPollProcessor } from "../tickets/eticket-poll.processor";
+import { OrdersController } from "./orders.controller";
+import { OrdersService } from "./orders.service";
 
 @Module({
   imports: [
@@ -34,20 +27,14 @@ import { TicketsQueueBull } from "./tickets.queue";
     PaymentsModule,
   ],
 
-  controllers: [OrdersController, TravelOrderController],
+  controllers: [OrdersController],
 
   providers: [
     OrdersService,
-    TravelOrderService,
-    { provide: "PaymentsPort", useClass: PaymentsAdapter },
-    { provide: "DuffelOrdersPort", useClass: DuffelAdapter },
-    { provide: "PriceBuilder", useClass: SimplePriceBuilder },
-    { provide: "TravelOrderRepo", useClass: RepoPrismaAdapter },
-    { provide: "TicketsQueue", useClass: TicketsQueueBull },
     EticketPollProcessor, // ⬅️ registriert den BullMQ-Worker
   ],
 
   // OrdersService auch in anderen Modulen nutzbar
-  exports: [OrdersService, TravelOrderService],
+  exports: [OrdersService],
 })
 export class OrdersModule {}

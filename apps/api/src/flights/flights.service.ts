@@ -213,7 +213,7 @@ export class FlightsService {
   // In FlightsService einfügen:
   async searchHoldChangeable(
     dto: SearchFlightsDto,
-    mode: FilterMode = "hold_and_changeable"
+    mode: FilterMode = "hold_only"
   ) {
     // --- Helfer: Passengers aus adults/children/infants bauen (Duffel erwartet Liste)
     const buildPassengers = () => {

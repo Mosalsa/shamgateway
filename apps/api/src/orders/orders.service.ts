@@ -1,25 +1,22 @@
 // apps/api/src/orders/orders.service.ts
+import { HttpService } from "@nestjs/axios";
+import { InjectQueue } from "@nestjs/bullmq";
 import {
-  Injectable,
-  HttpException,
   BadRequestException,
-  ConflictException,
+  HttpException,
+  Injectable,
   Logger,
 } from "@nestjs/common";
-import { HttpService } from "@nestjs/axios";
-import { PrismaService } from "../../prisma/prisma.service";
-import { firstValueFrom } from "rxjs";
-import { CreateOrderDto } from "./dto/create-order.dto";
-import { RefundOrderDto } from "./dto/refund-order.dto";
-import { randomBytes } from "crypto";
-import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
+import { firstValueFrom } from "rxjs";
+import { PrismaService } from "../../prisma/prisma.service";
+import { CreateOrderDto } from "./dto/create-order.dto";
 import {
-  CreateOrderChangeRequestDto,
-  ConfirmOrderChangeDto,
   ChangeSliceDto,
+  ConfirmOrderChangeDto,
+  CreateOrderChangeRequestDto,
 } from "./dto/order-change.dto";
-import { createHash } from "crypto";
+import { RefundOrderDto } from "./dto/refund-order.dto";
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
@@ -32,66 +29,6 @@ export class OrdersService {
   // -------- HELPERS --------
   private asDate(v?: string | null): Date | null {
     return v ? new Date(v) : null;
-  }
-
-  // private buildIdempotencyKey(dto: CreateOrderDto): string {
-  //   // Wir normalisieren nur die Felder, die kaufrelevant sind.
-  //   // Wichtig: KEIN timestamp hier, sonst wäre er wieder random.
-  //   const canonical = {
-  //     offerId: dto.offerId,
-  //     passengers: dto.passengers.map((p) => ({
-  //       id: p.id,
-  //       type: p.type,
-  //       title: p.title,
-  //       given_name: p.given_name,
-  //       family_name: p.family_name,
-  //       born_on: p.born_on,
-  //       gender: p.gender,
-  //       email: p.email,
-  //       phone_number: p.phone_number,
-  //     })),
-  //     payments: Array.isArray(dto.payments)
-  //       ? dto.payments.map((pay) => ({
-  //           type: pay.type,
-  //           currency: pay.currency,
-  //           amount: pay.amount,
-  //         }))
-  //       : [],
-  //   };
-
-  //   const raw = JSON.stringify(canonical);
-  //   return createHash("sha256").update(raw).digest("hex");
-  // }
-
-  private buildIdempotencyKey(dto: CreateOrderDto, userId: string): string {
-    const base = {
-      userId,
-      offerId: dto.offerId,
-      passengers: (dto.passengers || [])
-        .map((p) => ({
-          id: p.id,
-          type: p.type,
-          title: p.title,
-          given_name: p.given_name,
-          family_name: p.family_name,
-          born_on: p.born_on,
-          gender: p.gender,
-          email: p.email ?? null,
-          phone_number: p.phone_number ?? null,
-        }))
-        // Stabilisieren: nach id sortieren
-        .sort((a, b) => (a.id || "").localeCompare(b.id || "")),
-      payments: (dto.payments || [])
-        .map((x) => ({ type: x.type, currency: x.currency, amount: x.amount }))
-        .sort((a, b) =>
-          (a.type + a.currency + a.amount).localeCompare(
-            b.type + b.currency + b.amount
-          )
-        ),
-    };
-
-    const json = JSON.stringify(base);
-    return createHash("sha256").update(json).digest("hex");
   }
 
   private extractChangePolicy(order: any) {
@@ -305,7 +242,30 @@ export class OrdersService {
     return saved;
   }
 
-  // -------- CREATE ORDER (Duffel-konform, sofort persistieren) --------
+  private buildPricingFromDuffel(o: any) {
+    const flightAmountNum = Number(o?.total_amount ?? 0);
+    const currency = String(o?.total_currency ?? "USD");
+
+    const platformFeeNum = +(flightAmountNum * 0.05).toFixed(2); // v1: 5%
+    const paymentFeeNum = 2.0; // v1: fix
+
+    const totalNum = flightAmountNum + platformFeeNum + paymentFeeNum;
+
+    const toMoney = (n: number) => ({
+      amount: n.toFixed(2),
+      currency,
+    });
+
+    return {
+      currency,
+      flight: toMoney(flightAmountNum),
+      platform_fee: toMoney(platformFeeNum),
+      payment_fee: toMoney(paymentFeeNum),
+      total: toMoney(totalNum),
+    };
+  }
+
+  // -------- CREATE ORDER (Duffel HOLD + Stripe-first) --------
   async create(dto: CreateOrderDto, currentUserId: string) {
     // --- 0) Vorab-Checks ---
     if (!dto?.offerId) {
@@ -321,20 +281,20 @@ export class OrdersService {
       });
     }
 
-    // --- 1) Passengers für Duffel (nur erlaubte Felder) ---
+    // --- 1) Passengers für Duffel ---
     const duffelPassengers = dto.passengers.map((p) => ({
       id: p.id,
       type: p.type, // "adult" | "child" | ...
-      gender: p.gender, // "m" | "f" | "x"
-      title: p.title, // "mr" | "ms" | ...
+      gender: p.gender,
+      title: p.title,
       given_name: p.given_name,
       family_name: p.family_name,
-      born_on: p.born_on, // "YYYY-MM-DD"
+      born_on: p.born_on,
       email: p.email,
-      phone_number: p.phone_number, // E.164
+      phone_number: p.phone_number,
     }));
 
-    // --- 2) Offer einlesen + Fähigkeiten/Policies ermitteln ---
+    // --- 2) Offer laden ---
     const { data: offerResp } = await firstValueFrom(
       this.http.get(`/offers/${dto.offerId}`)
     );
@@ -348,25 +308,22 @@ export class OrdersService {
       });
     }
 
+    // unsere Preis-Logik (Airline + Fee + Marge)
+    const pricing = this.buildPricingFromDuffel(offer); // flight + platform_fee + payment_fee + total
+
     const pr = offer?.payment_requirements ?? {};
     const requiresInstant = pr?.requires_instant_payment === true;
-
-    // strikte Hold-Fähigkeit: Nur wenn Duffel uns eine Deadline nennt, kann man „hold“ machen
     const supportsHold = !requiresInstant && !!pr?.payment_required_by;
 
-    // deine Changeability-Policy (Top + Slice) bleibt bestehen
+    // Changeability-Policy wie bei dir
     const policy = this.extractChangePolicy({
       conditions: offer?.conditions,
       slices: offer?.slices,
     });
     const isChangeable = !!policy?.allowed;
 
-    // --- 3) Intent bestimmen + Guards ---
-    const hasPayments = Array.isArray(dto.payments) && dto.payments.length > 0;
-    const wantsHold = !hasPayments; // Keine payments => Kunde beabsichtigt Hold
-
-    // Wenn Kunde Hold will, Offer aber nicht hold-fähig => sauber ablehnen
-    if (wantsHold && !supportsHold) {
+    // === WIR WOLLEN IMMER HOLD + STRIPE-FIRST ===
+    if (!supportsHold) {
       throw new BadRequestException({
         code: "offer_not_holdable",
         message:
@@ -375,22 +332,6 @@ export class OrdersService {
       });
     }
 
-    // Wenn Kunde Instant will (payments geschickt), aber payments leer/fehlerhaft => ablehnen
-    if (!wantsHold) {
-      // payments müssen vollständig sein (type/currency/amount)
-      for (const pay of dto.payments!) {
-        if (!pay?.type || !pay?.currency || pay?.amount == null) {
-          throw new BadRequestException({
-            code: "instant_missing_payments",
-            message:
-              "Für 'instant' Bestellungen müssen gültige Zahlungen (type, currency, amount) mitgesendet werden.",
-            offer_id: dto.offerId,
-          });
-        }
-      }
-    }
-
-    // Optionaler Business-Guard (wie zuvor): wir verlangen explizit changeable
     if (!isChangeable) {
       throw new BadRequestException({
         code: "offer_not_changeable",
@@ -400,26 +341,15 @@ export class OrdersService {
       });
     }
 
-    // --- 4) Duffel-Body (type IMMER setzen; payments NUR bei instant senden) ---
-    const paymentsPayload = !wantsHold
-      ? dto.payments!.map((pay) => ({
-          type: pay.type, // z.B. "balance"
-          currency: String(pay.currency).toUpperCase(),
-          amount: String(pay.amount),
-        }))
-      : undefined;
-
+    // --- 4) Duffel-Body: IMMER type: 'hold', KEINE payments ---
     const bodyData: any = {
-      type: wantsHold ? "hold" : "instant",
+      type: "hold",
       selected_offers: [dto.offerId],
       passengers: duffelPassengers,
     };
-    if (paymentsPayload) {
-      bodyData.payments = paymentsPayload; // nur bei instant; NIE leeres Array
-    }
     const body = { data: bodyData };
 
-    // --- 5) Robuster Idempotency-Key (an das finale Payload gebunden) ---
+    // --- 5) Idempotency-Key ---
     const idem = this.buildRobustIdempotencyKey(
       currentUserId,
       dto.offerId,
@@ -446,27 +376,24 @@ export class OrdersService {
       throw new BadRequestException("Duffel did not return an order");
     }
 
-    // --- 7) Status/Type robust bestimmen (Sandbox kann beim type irren) ---
+    // --- 7) Status/Type bestimmen ---
     const awaitingPayment = o?.payment_status?.awaiting_payment === true;
     const alreadyPaidAt = o?.payment_status?.paid_at ?? null;
 
-    const inferredType: "instant" | "hold" =
-      o?.type === "instant" || o?.type === "hold"
-        ? o.type
-        : awaitingPayment
-        ? "hold"
-        : "instant";
-
+    const inferredType: "instant" | "hold" = "hold"; // wir erzwingen hold
     const resolvedStatus = this.resolveStatusFromDuffel(o);
 
-    // --- 8) DB upsert (nie hart failen, um Doppelbuchungen zu vermeiden) ---
+    // --- 8) DB upsert ---
+    // WICHTIG:
+    // - amount/currency = was der KUNDE zahlt (pricing.total)
+    // - Duffel-Total bleibt in o.total_amount / o.total_currency (für Info/Settlement)
     const dbData = {
       duffelId: String(o.id),
       offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
       userId: currentUserId,
       status: resolvedStatus,
-      amount: String(o.total_amount ?? "0"),
-      currency: String(o.total_currency ?? "USD"),
+      amount: pricing.total.amount, // Kundenpreis (Airline + Fee + Marge)
+      currency: pricing.currency,
       owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
       liveMode: !!o.live_mode,
       paymentStatus: awaitingPayment
@@ -511,7 +438,7 @@ export class OrdersService {
       this.logger.error(
         `DB upsert failed for Duffel order ${o.id}: ${dbErr?.message ?? dbErr}`
       );
-      // absichtlich kein throw, Order existiert bereits bei Duffel
+      // kein Throw – Order existiert bei Duffel auf jeden Fall
     }
 
     // --- 9) eTicket-Poller (idempotent enqueue) ---
@@ -532,15 +459,16 @@ export class OrdersService {
       );
     }
 
-    // --- 10) Klare Antwort ---
+    // --- 10) Antwort an Frontend ---
     return {
       order_id: o.id,
       status: resolvedStatus ?? "unknown",
-      order_type: inferredType, // "instant" | "hold"
+      order_type: inferredType, // "hold"
       awaiting_payment: awaitingPayment,
       paid_at: alreadyPaidAt ?? null,
-      total_amount: String(o.total_amount ?? "0"),
-      total_currency: String(o.total_currency ?? "USD"),
+      duffel_total_amount: String(o.total_amount ?? "0"), // Airline-Betrag (für Info)
+      duffel_total_currency: String(o.total_currency ?? "USD"),
+      pricing, // hier steht dein Kundenpreis + Fees drin
       owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
       live_mode: !!o.live_mode,
     };
@@ -785,75 +713,6 @@ export class OrdersService {
     };
   }
 
-  // --- v2 step 1: create order_change_request (quote)
-  // async createOrderChangeRequest(
-  //   orderId: string,
-  //   dto: CreateOrderChangeRequestDto
-  // ) {
-  //   const toSlice = (s: ChangeSliceDto) =>
-  //     s.slice_id
-  //       ? { slice_id: s.slice_id }
-  //       : {
-  //           origin: s.origin,
-  //           destination: s.destination,
-  //           departure_date: s.departure_date,
-  //         };
-
-  //   const body: any = { data: { order_id: orderId } };
-  //   if (dto.slices) {
-  //     body.data.slices = {};
-  //     if (dto.slices.add?.length)
-  //       body.data.slices.add = dto.slices.add.map(toSlice);
-  //     if (dto.slices.remove?.length)
-  //       body.data.slices.remove = dto.slices.remove.map(toSlice);
-  //   }
-  //   if (dto.services?.length) body.data.services = dto.services;
-
-  //   try {
-  //     const { data } = await firstValueFrom(
-  //       this.http.post(`/order_change_requests`, body)
-  //     );
-  //     const req = data?.data ?? data;
-
-  //     // optional: leicht in DB merken (nur IDs/Beträge)
-  //     await this.prisma.orderChangeRequest
-  //       ?.upsert?.({
-  //         where: { duffelRequestId: req.id },
-  //         update: {
-  //           orderDuffelId: orderId,
-  //           liveMode: !!req.live_mode,
-  //           expiresAt: req.expires_at ? new Date(req.expires_at) : null,
-  //         },
-  //         create: {
-  //           duffelRequestId: req.id,
-  //           orderDuffelId: orderId,
-  //           liveMode: !!req.live_mode,
-  //           expiresAt: req.expires_at ? new Date(req.expires_at) : null,
-  //         },
-  //       })
-  //       .catch(() => {});
-
-  //     return {
-  //       ok: true,
-  //       order_change_request_id: req.id, // req_...
-  //       expires_at: req.expires_at ?? null,
-  //       // Manche Duffel-Accounts liefern Offers inline in req; sonst leer:
-  //       offers_inline: req.order_change_offers ?? [],
-  //       raw: req,
-  //     };
-  //   } catch (err: any) {
-  //     return {
-  //       ok: false,
-  //       code: "change_request_failed",
-  //       message:
-  //         err?.response?.data?.error ??
-  //         err?.message ??
-  //         "Order change request failed",
-  //       details: err?.response?.data ?? null,
-  //     };
-  //   }
-  // }
-
   async createOrderChangeRequest(
     orderId: string,
     dto: CreateOrderChangeRequestDto
@@ -923,37 +782,6 @@ export class OrdersService {
     }
   }
 
-  // --- v2 step 2: list order_change_offers for a request
-  // async listOrderChangeOffers(
-  //   order_change_request_id: string,
-  //   query?: { after?: string; limit?: number }
-  // ) {
-  //   try {
-  //     const { data } = await firstValueFrom(
-  //       this.http.get(`/order_change_offers`, {
-  //         params: { order_change_request_id, ...(query ?? {}) },
-  //       })
-  //     );
-  //     const res = data?.data ?? data;
-  //     return {
-  //       ok: true,
-  //       order_change_request_id,
-  //       offers: Array.isArray(res) ? res : res?.order_change_offers ?? [],
-  //       raw: res,
-  //     };
-  //   } catch (err: any) {
-  //     return {
-  //       ok: false,
-  //       code: "offers_list_failed",
-  //       message:
-  //         err?.response?.data?.error ??
-  //         err?.message ??
-  //         "Order change offers list failed",
-  //       details: err?.response?.data ?? null,
-  //     };
-  //   }
-  // }
-
   async listOrderChangeOffers(
     order_change_request_id: string,
     query?: { after?: string; limit?: number }
@@ -1022,70 +850,6 @@ export class OrdersService {
       };
     }
   }
-
-  // --- v2 step 3: confirm (creates /air/order_changes)
-  // async confirmOrderChange(dto: ConfirmOrderChangeDto) {
-  //   const payload: any = {
-  //     data: {
-  //       order_change_request_id: dto.order_change_request_id,
-  //       selected_order_change_offer: dto.selected_order_change_offer,
-  //       ...(dto.payments?.length ? { payments: dto.payments } : {}),
-  //     },
-  //   };
-
-  //   try {
-  //     const { data } = await firstValueFrom(
-  //       this.http.post(`/order_changes`, payload)
-  //     );
-  //     const confirmed = data?.data ?? data;
-
-  //     // optional DB update + eTicket poll
-  //     if (confirmed?.order_id) {
-  //       await this.prisma.order
-  //         .update({
-  //           where: { duffelId: confirmed.order_id },
-  //           data: { status: "confirmed", lastEventType: "order.changed" },
-  //         })
-  //         .catch(() => {});
-  //       await this.eticketQueue
-  //         .add(
-  //           "poll",
-  //           { orderId: confirmed.order_id, attempt: 1 },
-  //           {
-  //             jobId: `poll:${confirmed.order_id}`,
-  //             delay: 3000,
-  //             removeOnComplete: true,
-  //             removeOnFail: true,
-  //           }
-  //         )
-  //         .catch(() => {});
-  //     }
-
-  //     return {
-  //       ok: true,
-  //       change_id: confirmed.id, // ocr_...
-  //       order_id: confirmed.order_id ?? null,
-  //       confirmed_at: confirmed.confirmed_at ?? new Date().toISOString(),
-  //       new_total_amount: confirmed.new_total_amount ?? null,
-  //       new_total_currency: confirmed.new_total_currency ?? null,
-  //       penalty_amount: confirmed.penalty_total_amount ?? null,
-  //       penalty_currency: confirmed.penalty_total_currency ?? null,
-  //       raw: confirmed,
-  //     };
-  //   } catch (err: any) {
-  //     return {
-  //       ok: false,
-  //       code: "change_confirm_failed",
-  //       message:
-  //         err?.response?.data?.error ??
-  //         err?.message ??
-  //         "Order change confirmation failed",
-  //       details: err?.response?.data ?? null,
-  //     };
-  //   }
-  // }
-
-  // dto: { order_change_request_id: string; selected_order_change_offer: string; payments?: [...] }
 
   async confirmOrderChange(dto: ConfirmOrderChangeDto) {
     const payload: any = {
