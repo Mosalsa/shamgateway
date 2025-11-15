@@ -332,14 +332,14 @@ export class OrdersService {
       });
     }
 
-    if (!isChangeable) {
-      throw new BadRequestException({
-        code: "offer_not_changeable",
-        message:
-          "Dieses Angebot ist nicht änderbar. Bitte ein 'changeable' Angebot wählen.",
-        offer_id: dto.offerId,
-      });
-    }
+    // if (!isChangeable) {
+    //   throw new BadRequestException({
+    //     code: "offer_not_changeable",
+    //     message:
+    //       "Dieses Angebot ist nicht änderbar. Bitte ein 'changeable' Angebot wählen.",
+    //     offer_id: dto.offerId,
+    //   });
+    // }
 
     // --- 4) Duffel-Body: IMMER type: 'hold', KEINE payments ---
     const bodyData: any = {

@@ -14,7 +14,7 @@ import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
 import { PrismaService } from "../../prisma/prisma.service";
 import { RefundOrderDto } from "../orders/dto/refund-order.dto";
-
+import { CreateCheckoutDto } from "./dto/create-checkout.dto";
 const PAYMENTS_DEBUG = process.env.PAYMENTS_DEBUG === "1";
 
 function safeJson(obj: unknown) {
@@ -30,6 +30,7 @@ export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
   private readonly stripe: Stripe;
   private readonly webhookSecret?: string;
+  private frontendBaseUrl: string;
 
   constructor(
     private readonly cfg: ConfigService,
@@ -46,6 +47,8 @@ export class PaymentsService {
       appInfo: { name: "shamgateway", version: "1.0.0" },
     });
     this.webhookSecret = this.cfg.get<string>("STRIPE_WEBHOOK_SECRET");
+    this.frontendBaseUrl =
+      this.cfg.get<string>("FRONTEND_BASE_URL") ?? "http://localhost:3001";
   }
 
   ping() {
@@ -1161,5 +1164,45 @@ export class PaymentsService {
         payment_intent: pi.id,
       });
     }
+  }
+
+  // apps/api/src/payments/payments.service.ts
+  async createCheckoutSession(dto: CreateCheckoutDto) {
+    const amountInCents = Math.round(dto.amount * 100);
+
+    const session = await this.stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: dto.currency.toLowerCase(),
+            unit_amount: amountInCents,
+            product_data: {
+              name: `Flight booking`,
+              description: dto.description ?? `Order ${dto.orderId}`,
+            },
+          },
+        },
+      ],
+      // 🔑 hier binden wir OrderId an den PI
+      payment_intent_data: {
+        metadata: {
+          duffel_order_id: dto.orderId,
+          kind: "duffel_order",
+        },
+      },
+      metadata: {
+        orderId: dto.orderId,
+      },
+      success_url: `${this.frontendBaseUrl}/checkout/success?orderId=${dto.orderId}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${this.frontendBaseUrl}/checkout/${dto.orderId}?cancelled=1`,
+    });
+
+    return {
+      checkoutUrl: session.url,
+      sessionId: session.id,
+    };
   }
 }

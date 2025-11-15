@@ -15,6 +15,7 @@ import type { Request } from "express";
 import { PaymentsService } from "./payments.service";
 import { CreateIntentDto } from "./dto/create-intent.dto";
 import { RefundOrderDto } from "../orders/dto/refund-order.dto";
+import { CreateCheckoutDto } from "./dto/create-checkout.dto";
 @Controller("payments")
 export class PaymentsController {
   constructor(private readonly payments: PaymentsService) {}
@@ -64,5 +65,11 @@ export class PaymentsController {
     @Body() body: { amount: string; currency: string; reason?: string }
   ) {
     return this.payments.refundStripePartial(orderId, body);
+  }
+
+  // apps/api/src/payments/payments.controller.ts
+  @Post("checkout")
+  createCheckout(@Body() dto: CreateCheckoutDto) {
+    return this.payments.createCheckoutSession(dto);
   }
 }

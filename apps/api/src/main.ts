@@ -14,6 +14,11 @@ async function bootstrap() {
     })
   );
 
+  app.enableCors({
+    origin: true, // erlaubt localhost:3001 usw.
+    credentials: true,
+  });
+
   // ✅ GENAU der Webhook-Pfad + roher Body NUR für diese Route
   app.use(
     "/payments/webhook/stripe",
