@@ -63,11 +63,11 @@ export class FlightsController {
   // ...innerhalb der bestehenden FlightsController-Klasse ANS ENDE anhängen:
 
   // GET /flights/offers/:id
-  @Get("offers/:id")
-  getOffer(@Param("id") id: string) {
-    if (!id) throw new BadRequestException("offer id is required");
-    return this.flights.getOffer(id);
-  }
+  // @Get("offers/:id")
+  // getOffer(@Param("id") id: string) {
+  //   if (!id) throw new BadRequestException("offer id is required");
+  //   return this.flights.getOffer(id);
+  // }
 
   // GET /flights/offers?offer_request_id=...&after=...&limit=...
   @Get("offers")
@@ -150,5 +150,19 @@ export class FlightsController {
   )
   searchSummary(@Body() dto: SearchFlightsDto) {
     return this.flights.searchSummary(dto);
+  }
+
+  // GET /flights/offers/:id?with_fares=true
+  @Get("offers/:id")
+  getOffer(@Param("id") id: string, @Query("with_fares") withFares?: string) {
+    if (!id) throw new BadRequestException("offer id is required");
+
+    // wenn ?with_fares=true → Offer + Fare-Optionen zurückgeben
+    if (withFares === "true") {
+      return this.flights.getOfferWithFareOptions(id);
+    }
+
+    // sonst wie bisher: nur rohes Duffel-Offer
+    return this.flights.getOffer(id);
   }
 }

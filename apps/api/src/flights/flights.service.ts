@@ -638,4 +638,218 @@ export class FlightsService {
       note: "Klassifikation basiert auf offer.payment_requirements.requires_instant_payment bzw. payment_required_by.",
     };
   }
+
+  // ==================================================
+  // NEU: Fare-Optionen für ein Offer (Basic / Comfort / Premium)
+  // ==================================================
+
+  /** prüft, ob zwei Offers das gleiche Itinerary (gleiche Slices/Segmente) haben */
+  private sameItinerary(a: any, b: any): boolean {
+    const sa = Array.isArray(a?.slices) ? a.slices : [];
+    const sb = Array.isArray(b?.slices) ? b.slices : [];
+    if (sa.length !== sb.length) return false;
+
+    for (let i = 0; i < sa.length; i++) {
+      const segA = Array.isArray(sa[i]?.segments) ? sa[i].segments : [];
+      const segB = Array.isArray(sb[i]?.segments) ? sb[i].segments : [];
+      if (segA.length !== segB.length) return false;
+
+      for (let j = 0; j < segA.length; j++) {
+        const aSeg = segA[j];
+        const bSeg = segB[j];
+        if (
+          aSeg?.origin?.iata_code !== bSeg?.origin?.iata_code ||
+          aSeg?.destination?.iata_code !== bSeg?.destination?.iata_code ||
+          aSeg?.departing_at !== bSeg?.departing_at
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /** baut die Bullet-Liste wie auf deiner Detailseite aus conditions + Bags */
+  private buildFareRulesFromOffer(offer: any): string[] {
+    const rules: string[] = [];
+
+    const topCond = offer?.conditions ?? {};
+    const sliceCond =
+      offer?.slices?.[0]?.conditions ??
+      offer?.slices?.[0]?.conditions_before_departure ??
+      {};
+
+    const change =
+      topCond.change_before_departure ??
+      sliceCond.change_before_departure ??
+      {};
+    const refund =
+      topCond.refund_before_departure ??
+      sliceCond.refund_before_departure ??
+      {};
+
+    // Changes
+    if (change.allowed === true) {
+      const fee =
+        change.change_penalty_amount ??
+        change.penalty_amount ??
+        change.amount ??
+        null;
+      const cur =
+        change.change_penalty_currency ??
+        change.penalty_currency ??
+        change.currency ??
+        offer.total_currency ??
+        null;
+      if (fee && cur) {
+        rules.push(`Changeable (${fee} ${cur} fee)`);
+      } else {
+        rules.push("Changeable");
+      }
+    } else if (change.allowed === false) {
+      rules.push("Not changeable");
+    } else {
+      rules.push("No data on changes");
+    }
+
+    // Refunds
+    if (refund.allowed === true) {
+      const fee =
+        refund.refund_penalty_amount ??
+        refund.penalty_amount ??
+        refund.amount ??
+        null;
+      const cur =
+        refund.refund_penalty_currency ??
+        refund.penalty_currency ??
+        refund.currency ??
+        offer.total_currency ??
+        null;
+      if (fee && cur) {
+        rules.push(`Refundable (${fee} ${cur} fee)`);
+      } else {
+        rules.push("Refundable");
+      }
+    } else if (refund.allowed === false) {
+      rules.push("Not refundable");
+    } else {
+      rules.push("No data on refunds");
+    }
+
+    // Payment / Hold
+    const pr = offer?.payment_requirements ?? {};
+    if (pr.requires_instant_payment === true) {
+      rules.push("Instant payment required");
+    } else if (
+      pr.payment_required_by ||
+      pr.requires_instant_payment === false
+    ) {
+      rules.push("Hold space (no instant payment required)");
+    } else {
+      rules.push("No data about payment requirements");
+    }
+
+    // Cabin & Checked bags – aus slice.conditions.* oder offer.*
+    const slice0 = Array.isArray(offer?.slices) ? offer.slices[0] : undefined;
+    const cabin =
+      slice0?.conditions?.included_cabin_bags ??
+      offer?.included_cabin_bags ??
+      null;
+    const checked =
+      slice0?.conditions?.included_checked_bags ??
+      offer?.included_checked_bags ??
+      null;
+
+    if (cabin && typeof cabin.quantity === "number" && cabin.quantity > 0) {
+      rules.push(
+        `Includes cabin bags (${cabin.quantity} bag${
+          cabin.quantity > 1 ? "s" : ""
+        })`
+      );
+    } else {
+      rules.push("No data about cabin bags");
+    }
+
+    if (
+      checked &&
+      typeof checked.quantity === "number" &&
+      checked.quantity > 0
+    ) {
+      rules.push(
+        `Includes checked bags (${checked.quantity} bag${
+          checked.quantity > 1 ? "s" : ""
+        })`
+      );
+    } else {
+      rules.push("No data about checked bags");
+    }
+
+    return rules;
+  }
+
+  /** Name der Fare-Option (Basic / Comfort / Premium …) */
+  private buildFareName(offer: any): string {
+    return (
+      offer?.fare_brand_name ??
+      offer?.brand_name ??
+      offer?.cabin_class_marketing_name ??
+      offer?.cabin_class ??
+      "Economy"
+    );
+  }
+
+  /**
+   * Hauptfunktion:
+   *  - Holt das Offer
+   *  - Liest offer_request_id
+   *  - Holt alle Offers dieses Requests
+   *  - Filtert gleiche Route
+   *  - Baut Fare-Liste mit echten Regeln
+   */
+  async getOfferWithFareOptions(id: string) {
+    const baseOffer = await this.getOffer(id);
+    if (!baseOffer || !baseOffer.id) {
+      throw new HttpException("Offer not found", 404);
+    }
+
+    const offerRequestId =
+      baseOffer.offer_request_id ?? baseOffer.offer_request?.id;
+    let siblings: any[] = [];
+    console.log(
+      "DBG baseOffer",
+      baseOffer.id,
+      "offer_request_id",
+      offerRequestId
+    );
+    if (offerRequestId) {
+      const raw = await this.listOffersByRequest(offerRequestId, {
+        limit: 50,
+      });
+      const all = Array.isArray(raw) ? raw : raw?.data ?? [];
+      siblings = all.filter((o: any) => this.sameItinerary(o, baseOffer));
+      console.log("DBG siblings for", id, siblings.length);
+    }
+
+    if (!siblings.length) {
+      siblings = [baseOffer];
+    }
+
+    const fares = siblings
+      .map((o) => ({
+        id: o.id,
+        name: this.buildFareName(o),
+        cabin_class: o.cabin_class,
+        total_amount: o.total_amount,
+        total_currency: o.total_currency,
+        rules: this.buildFareRulesFromOffer(o),
+      }))
+      .sort(
+        (a, b) => Number(a.total_amount ?? 0) - Number(b.total_amount ?? 0)
+      );
+
+    return {
+      offer: baseOffer,
+      fares,
+    };
+  }
 }
