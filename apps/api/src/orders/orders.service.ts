@@ -266,6 +266,215 @@ export class OrdersService {
   }
 
   // -------- CREATE ORDER (Duffel HOLD + Stripe-first) --------
+  // async create(dto: CreateOrderDto, currentUserId: string) {
+  //   // --- 0) Vorab-Checks ---
+  //   if (!dto?.offerId) {
+  //     throw new BadRequestException({
+  //       code: "missing_offer_id",
+  //       message: "offerId is required",
+  //     });
+  //   }
+  //   if (!Array.isArray(dto?.passengers) || dto.passengers.length === 0) {
+  //     throw new BadRequestException({
+  //       code: "missing_passengers",
+  //       message: "At least one passenger is required",
+  //     });
+  //   }
+
+  //   // --- 1) Passengers für Duffel ---
+  //   const duffelPassengers = dto.passengers.map((p) => ({
+  //     id: p.id,
+  //     type: p.type, // "adult" | "child" | ...
+  //     gender: p.gender,
+  //     title: p.title,
+  //     given_name: p.given_name,
+  //     family_name: p.family_name,
+  //     born_on: p.born_on,
+  //     email: p.email,
+  //     phone_number: p.phone_number,
+  //   }));
+
+  //   // --- 2) Offer laden ---
+  //   const { data: offerResp } = await firstValueFrom(
+  //     this.http.get(`/offers/${dto.offerId}`)
+  //   );
+  //   const offer = offerResp?.data ?? offerResp;
+
+  //   if (!offer?.id) {
+  //     throw new BadRequestException({
+  //       code: "offer_not_found",
+  //       message: "Offer could not be loaded",
+  //       offer_id: dto.offerId,
+  //     });
+  //   }
+
+  //   // unsere Preis-Logik (Airline + Fee + Marge)
+  //   const pricing = this.buildPricingFromDuffel(offer); // flight + platform_fee + payment_fee + total
+
+  //   const pr = offer?.payment_requirements ?? {};
+  //   const requiresInstant = pr?.requires_instant_payment === true;
+  //   const supportsHold = !requiresInstant && !!pr?.payment_required_by;
+
+  //   // Changeability-Policy wie bei dir
+  //   const policy = this.extractChangePolicy({
+  //     conditions: offer?.conditions,
+  //     slices: offer?.slices,
+  //   });
+  //   const isChangeable = !!policy?.allowed;
+
+  //   // === WIR WOLLEN IMMER HOLD + STRIPE-FIRST ===
+  //   if (!supportsHold) {
+  //     throw new BadRequestException({
+  //       code: "offer_not_holdable",
+  //       message:
+  //         "Dieses Angebot kann nicht auf 'Hold' gesetzt werden. Bitte ein hold-fähiges Angebot wählen.",
+  //       offer_id: dto.offerId,
+  //     });
+  //   }
+
+  //   // if (!isChangeable) {
+  //   //   throw new BadRequestException({
+  //   //     code: "offer_not_changeable",
+  //   //     message:
+  //   //       "Dieses Angebot ist nicht änderbar. Bitte ein 'changeable' Angebot wählen.",
+  //   //     offer_id: dto.offerId,
+  //   //   });
+  //   // }
+
+  //   // --- 4) Duffel-Body: IMMER type: 'hold', KEINE payments ---
+  //   const bodyData: any = {
+  //     type: "hold",
+  //     selected_offers: [dto.offerId],
+  //     passengers: duffelPassengers,
+  //   };
+  //   const body = { data: bodyData };
+
+  //   // --- 5) Idempotency-Key ---
+  //   const idem = this.buildRobustIdempotencyKey(
+  //     currentUserId,
+  //     dto.offerId,
+  //     bodyData
+  //   );
+
+  //   // --- 6) Duffel call ---
+  //   let o: any;
+  //   try {
+  //     const { data } = await firstValueFrom(
+  //       this.http.post("/orders", body, {
+  //         headers: { "Idempotency-Key": idem },
+  //       })
+  //     );
+  //     o = data?.data ?? data;
+  //   } catch (err: any) {
+  //     throw new HttpException(
+  //       err?.response?.data ?? err?.message ?? "Unknown error",
+  //       err?.response?.status ?? 500
+  //     );
+  //   }
+
+  //   if (!o?.id) {
+  //     throw new BadRequestException("Duffel did not return an order");
+  //   }
+
+  //   // --- 7) Status/Type bestimmen ---
+  //   const awaitingPayment = o?.payment_status?.awaiting_payment === true;
+  //   const alreadyPaidAt = o?.payment_status?.paid_at ?? null;
+
+  //   const inferredType: "instant" | "hold" = "hold"; // wir erzwingen hold
+  //   const resolvedStatus = this.resolveStatusFromDuffel(o);
+
+  //   // --- 8) DB upsert ---
+  //   // WICHTIG:
+  //   // - amount/currency = was der KUNDE zahlt (pricing.total)
+  //   // - Duffel-Total bleibt in o.total_amount / o.total_currency (für Info/Settlement)
+  //   const dbData = {
+  //     duffelId: String(o.id),
+  //     offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
+  //     userId: currentUserId,
+  //     status: resolvedStatus,
+  //     amount: pricing.total.amount, // Kundenpreis (Airline + Fee + Marge)
+  //     currency: pricing.currency,
+  //     owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
+  //     liveMode: !!o.live_mode,
+  //     paymentStatus: awaitingPayment
+  //       ? "awaiting_payment"
+  //       : alreadyPaidAt
+  //       ? "succeeded"
+  //       : null,
+  //     paidAt: this.asDate(alreadyPaidAt),
+  //     awaitingPayment: awaitingPayment
+  //       ? true
+  //       : o?.payment_status?.awaiting_payment === false
+  //       ? false
+  //       : null,
+  //     paymentRequiredBy: this.asDate(o?.payment_status?.payment_required_by),
+  //     priceGuaranteeExpiresAt: this.asDate(
+  //       o?.payment_status?.price_guarantee_expires_at ??
+  //         o?.price_guarantee_expires_at
+  //     ),
+  //     bookingRef: o?.booking_reference ?? null,
+  //     documents: Array.isArray(o?.documents) ? (o.documents as any) : null,
+  //     segments: Array.isArray(o?.slices) ? (o.slices as any) : null,
+  //     passengers: Array.isArray(o?.passengers) ? (o.passengers as any) : null,
+  //     lastEventType: "order.created",
+  //     idempotencyKey: idem as any,
+  //   };
+
+  //   try {
+  //     await this.prisma.order.upsert({
+  //       where: { duffelId: o.id },
+  //       create: dbData as any,
+  //       update: dbData as any,
+  //     });
+
+  //     if (Array.isArray(o?.documents) && o.documents.length > 0) {
+  //       await this.persistTicketDocuments(o.id, o.documents).catch((e) => {
+  //         this.logger.warn(
+  //           `persistTicketDocuments failed for ${o.id}: ${e?.message ?? e}`
+  //         );
+  //       });
+  //     }
+  //   } catch (dbErr: any) {
+  //     this.logger.error(
+  //       `DB upsert failed for Duffel order ${o.id}: ${dbErr?.message ?? dbErr}`
+  //     );
+  //     // kein Throw – Order existiert bei Duffel auf jeden Fall
+  //   }
+
+  //   // --- 9) eTicket-Poller (idempotent enqueue) ---
+  //   try {
+  //     await this.eticketQueue.add(
+  //       "poll",
+  //       { orderId: o.id, attempt: 1 },
+  //       {
+  //         jobId: `poll-${o.id}`,
+  //         delay: 3000,
+  //         removeOnComplete: true,
+  //         removeOnFail: true,
+  //       }
+  //     );
+  //   } catch (qErr) {
+  //     this.logger.warn(
+  //       `eticket-poll enqueue failed for ${o.id}: ${qErr as any}`
+  //     );
+  //   }
+
+  //   // --- 10) Antwort an Frontend ---
+  //   return {
+  //     order_id: o.id,
+  //     status: resolvedStatus ?? "unknown",
+  //     order_type: inferredType, // "hold"
+  //     awaiting_payment: awaitingPayment,
+  //     paid_at: alreadyPaidAt ?? null,
+  //     duffel_total_amount: String(o.total_amount ?? "0"), // Airline-Betrag (für Info)
+  //     duffel_total_currency: String(o.total_currency ?? "USD"),
+  //     pricing, // hier steht dein Kundenpreis + Fees drin
+  //     owner: o?.owner?.iata_code ?? o?.owner?.name ?? null,
+  //     live_mode: !!o.live_mode,
+  //   };
+  // }
+
+  // -------- CREATE ORDER (Duffel HOLD/INSTANT + Stripe-first) --------
   async create(dto: CreateOrderDto, currentUserId: string) {
     // --- 0) Vorab-Checks ---
     if (!dto?.offerId) {
@@ -281,18 +490,23 @@ export class OrdersService {
       });
     }
 
-    // --- 1) Passengers für Duffel ---
-    const duffelPassengers = dto.passengers.map((p) => ({
-      id: p.id,
-      type: p.type, // "adult" | "child" | ...
-      gender: p.gender,
-      title: p.title,
-      given_name: p.given_name,
-      family_name: p.family_name,
-      born_on: p.born_on,
-      email: p.email,
-      phone_number: p.phone_number,
-    }));
+    // --- 1) Passengers für Duffel (v2-konform, ohne type) ---
+    const duffelPassengers = dto.passengers.map((p) => {
+      const passenger: any = {
+        id: p.id, // pas_... from offer request
+        given_name: p.given_name,
+        family_name: p.family_name,
+      };
+
+      if (p.gender) passenger.gender = p.gender;
+      if (p.title) passenger.title = p.title;
+      if (p.born_on) passenger.born_on = p.born_on;
+      if (p.email) passenger.email = p.email;
+      if (p.phone_number) passenger.phone_number = p.phone_number;
+
+      // optional: identity_documents, loyalty_programme_accounts etc. später
+      return passenger;
+    });
 
     // --- 2) Offer laden ---
     const { data: offerResp } = await firstValueFrom(
@@ -308,85 +522,316 @@ export class OrdersService {
       });
     }
 
-    // unsere Preis-Logik (Airline + Fee + Marge)
+    // 🔸 2a) Expiry pre-check
+    if (offer.expires_at && new Date(offer.expires_at) <= new Date()) {
+      throw new BadRequestException({
+        code: "offer_no_longer_available",
+        message:
+          "Dieses Angebot ist nicht mehr verfügbar. Bitte eine neue Suche durchführen und ein aktuelles Angebot wählen.",
+        offer_id: dto.offerId,
+      });
+    }
+
+    // unsere Preis-Logik für den KUNDEN (Airline + Plattform + Payment-Fee)
     const pricing = this.buildPricingFromDuffel(offer); // flight + platform_fee + payment_fee + total
 
     const pr = offer?.payment_requirements ?? {};
     const requiresInstant = pr?.requires_instant_payment === true;
     const supportsHold = !requiresInstant && !!pr?.payment_required_by;
 
-    // Changeability-Policy wie bei dir
+    // (Change-Policy nur Info im Moment)
     const policy = this.extractChangePolicy({
       conditions: offer?.conditions,
       slices: offer?.slices,
     });
     const isChangeable = !!policy?.allowed;
 
-    // === WIR WOLLEN IMMER HOLD + STRIPE-FIRST ===
-    if (!supportsHold) {
-      throw new BadRequestException({
-        code: "offer_not_holdable",
-        message:
-          "Dieses Angebot kann nicht auf 'Hold' gesetzt werden. Bitte ein hold-fähiges Angebot wählen.",
-        offer_id: dto.offerId,
-      });
+    // Basis für Payment-Betrag Richtung Duffel
+    const baseAmount = String(offer.total_amount ?? pricing.flight.amount);
+    const baseCurrency = String(offer.total_currency ?? pricing.currency);
+
+    // --- 3) Primären Order-Typ + Payments bestimmen ---
+    // Ziel:
+    //  - instant-only Offer => "instant" mit payments (Stripe vorher erledigt)
+    //  - hold-fähiges Offer => Standard: "hold" ohne payments (Stripe-first, Duffel-Balance später)
+    //  - falls Airline Hold doch nicht akzeptiert -> Auto-Fallback auf instant+balance
+    let primaryOrderType: "instant" | "hold";
+    let primaryPayments:
+      | { type: string; amount: string; currency: string }[]
+      | null = null;
+
+    if (requiresInstant) {
+      // Dieses Offer MUSS instant gebucht werden
+      if (dto.payments && dto.payments.length > 0) {
+        primaryPayments = dto.payments.map((p) => ({
+          type: p.type,
+          amount: p.amount,
+          currency: p.currency,
+        }));
+      } else {
+        // Fallback: wir zahlen aus Duffel-Balance
+        primaryPayments = [
+          {
+            type: "balance",
+            amount: baseAmount,
+            currency: baseCurrency,
+          },
+        ];
+      }
+      primaryOrderType = "instant";
+    } else {
+      // requiresInstant === false -> Offer kann gehalten werden
+      if (dto.payments && dto.payments.length > 0) {
+        // Du willst bewusst sofort bezahlen -> instant
+        primaryPayments = dto.payments.map((p) => ({
+          type: p.type,
+          amount: p.amount,
+          currency: p.currency,
+        }));
+        primaryOrderType = "instant";
+      } else if (supportsHold) {
+        // Standard-Flow: Hold ohne payments (Stripe-first, später /payments mit balance)
+        primaryOrderType = "hold";
+        primaryPayments = null;
+      } else {
+        // Safety: kein requiresInstant aber auch kein payment_required_by -> instant mit balance
+        primaryPayments = [
+          {
+            type: "balance",
+            amount: baseAmount,
+            currency: baseCurrency,
+          },
+        ];
+        primaryOrderType = "instant";
+      }
     }
 
-    // if (!isChangeable) {
-    //   throw new BadRequestException({
-    //     code: "offer_not_changeable",
-    //     message:
-    //       "Dieses Angebot ist nicht änderbar. Bitte ein 'changeable' Angebot wählen.",
-    //     offer_id: dto.offerId,
-    //   });
-    // }
+    // --- 4) HTTP-Call mit optionalem Auto-Fallback (hold -> instant) ---
+    const tryCreateOrderOnDuffel = async (
+      orderType: "instant" | "hold",
+      payments: { type: string; amount: string; currency: string }[] | null
+    ): Promise<any> => {
+      const bodyData: any = {
+        type: orderType,
+        selected_offers: [dto.offerId],
+        passengers: duffelPassengers,
+      };
 
-    // --- 4) Duffel-Body: IMMER type: 'hold', KEINE payments ---
-    const bodyData: any = {
-      type: "hold",
-      selected_offers: [dto.offerId],
-      passengers: duffelPassengers,
+      if (orderType === "instant" && payments && payments.length) {
+        bodyData.payments = payments;
+      }
+
+      const body = { data: bodyData };
+
+      const idem = this.buildRobustIdempotencyKey(
+        currentUserId,
+        dto.offerId,
+        bodyData
+      );
+
+      try {
+        const { data } = await firstValueFrom(
+          this.http.post("/orders", body, {
+            headers: { "Idempotency-Key": idem },
+          })
+        );
+        const o = data?.data ?? data;
+
+        if (!o?.id) {
+          throw new BadRequestException("Duffel did not return an order");
+        }
+
+        return { order: o, idempotencyKey: idem };
+      } catch (err: any) {
+        // Timeout des HttpService (Axios)
+        if (
+          err?.code === "ECONNABORTED" ||
+          String(err?.message ?? "").includes("timeout")
+        ) {
+          throw new HttpException(
+            {
+              code: "duffel_timeout",
+              message:
+                "Die Kommunikation mit Duffel hat zu lange gedauert. Bitte versuche es in ein paar Sekunden erneut.",
+            },
+            504
+          );
+        }
+
+        const status = err?.response?.status ?? 500;
+        const payload = err?.response?.data ?? null;
+        const duffelErrors = payload?.errors;
+
+        // Fehler zurückgeben, damit der Aufrufer ggf. Fallback machen kann
+        return { error: err, payload, duffelErrors, status };
+      }
     };
-    const body = { data: bodyData };
 
-    // --- 5) Idempotency-Key ---
-    const idem = this.buildRobustIdempotencyKey(
-      currentUserId,
-      dto.offerId,
-      bodyData
+    // --- 5) Primärer Versuch ---
+    let finalOrder: any | null = null;
+    let finalIdempotencyKey: string | null = null;
+
+    const primaryResult = await tryCreateOrderOnDuffel(
+      primaryOrderType,
+      primaryPayments
     );
 
-    // --- 6) Duffel call ---
-    let o: any;
-    try {
-      const { data } = await firstValueFrom(
-        this.http.post("/orders", body, {
-          headers: { "Idempotency-Key": idem },
-        })
-      );
-      o = data?.data ?? data;
-    } catch (err: any) {
-      throw new HttpException(
-        err?.response?.data ?? err?.message ?? "Unknown error",
-        err?.response?.status ?? 500
-      );
+    if (primaryResult.order) {
+      finalOrder = primaryResult.order;
+      finalIdempotencyKey = primaryResult.idempotencyKey;
+    } else {
+      const duffelErrors = primaryResult.duffelErrors as any[] | undefined;
+      const status = primaryResult.status ?? 500;
+      const payload = primaryResult.payload;
+
+      // --- 5a) Spezial-Fall: Hold wurde abgelehnt -> Fallback auf instant+balance ---
+      const canRetryAsInstant =
+        primaryOrderType === "hold" &&
+        Array.isArray(duffelErrors) &&
+        duffelErrors.length > 0 &&
+        duffelErrors.some((e) => {
+          const code = e?.code;
+          const pointer = e?.source?.pointer ?? null;
+          return (
+            code === "invalid_order_create_type" ||
+            (code === "not_valid_with_selected_offer" && pointer === "/type")
+          );
+        });
+
+      if (canRetryAsInstant) {
+        // Fallback: instant mit balance (oder dto.payments, falls vorhanden)
+        const fallbackPayments = (
+          dto.payments && dto.payments.length > 0
+            ? dto.payments.map((p) => ({
+                type: p.type,
+                amount: p.amount,
+                currency: p.currency,
+              }))
+            : [
+                {
+                  type: "balance",
+                  amount: baseAmount,
+                  currency: baseCurrency,
+                },
+              ]
+        ) as { type: string; amount: string; currency: string }[];
+
+        const fallbackResult = await tryCreateOrderOnDuffel(
+          "instant",
+          fallbackPayments
+        );
+
+        if (fallbackResult.order) {
+          finalOrder = fallbackResult.order;
+          finalIdempotencyKey = fallbackResult.idempotencyKey;
+        } else {
+          // Fallback auch gescheitert -> normalen Fehler-Mapping-Weg
+          const fbErrors = fallbackResult.duffelErrors as any[] | undefined;
+          const fbStatus = fallbackResult.status ?? 500;
+          const fbPayload = fallbackResult.payload;
+
+          if (Array.isArray(fbErrors) && fbErrors.length > 0) {
+            const primary = fbErrors[0];
+            const code = primary?.code;
+
+            if (
+              code === "offer_no_longer_available" ||
+              code === "offer_expired"
+            ) {
+              throw new BadRequestException({
+                code: "offer_no_longer_available",
+                message:
+                  "Dieses Angebot ist nicht mehr verfügbar. Bitte eine neue Suche durchführen und ein aktuelles Angebot wählen.",
+                offer_id: dto.offerId,
+              });
+            }
+            if (code === "order_creation_already_attempted") {
+              throw new BadRequestException({
+                code: "order_creation_already_attempted",
+                message:
+                  "Für dieses Angebot wurde bereits eine Buchung versucht. Bitte lade deine Buchungen oder starte eine neue Suche.",
+                offer_id: dto.offerId,
+              });
+            }
+            if (code === "internal_server_error") {
+              throw new HttpException(
+                {
+                  code: "duffel_internal_error",
+                  message:
+                    "Bei Duffel ist ein interner Fehler aufgetreten. Bitte später erneut versuchen.",
+                  duffel_request_id: fbPayload?.meta?.request_id ?? null,
+                },
+                502
+              );
+            }
+          }
+
+          throw new HttpException(
+            fbPayload ?? fallbackResult.error?.message ?? "Unknown error",
+            fbStatus
+          );
+        }
+      } else if (Array.isArray(duffelErrors) && duffelErrors.length > 0) {
+        // --- 5b) Kein Fallback oder nicht passend -> normales Mapping auf unsere Fehler ---
+        const primary = duffelErrors[0];
+        const code = primary?.code;
+
+        if (code === "offer_no_longer_available" || code === "offer_expired") {
+          throw new BadRequestException({
+            code: "offer_no_longer_available",
+            message:
+              "Dieses Angebot ist nicht mehr verfügbar. Bitte eine neue Suche durchführen und ein aktuelles Angebot wählen.",
+            offer_id: dto.offerId,
+          });
+        }
+
+        if (code === "order_creation_already_attempted") {
+          throw new BadRequestException({
+            code: "order_creation_already_attempted",
+            message:
+              "Für dieses Angebot wurde bereits eine Buchung versucht. Bitte lade deine Buchungen oder starte eine neue Suche.",
+            offer_id: dto.offerId,
+          });
+        }
+
+        if (code === "internal_server_error") {
+          throw new HttpException(
+            {
+              code: "duffel_internal_error",
+              message:
+                "Bei Duffel ist ein interner Fehler aufgetreten. Bitte später erneut versuchen.",
+              duffel_request_id: payload?.meta?.request_id ?? null,
+            },
+            502
+          );
+        }
+
+        throw new HttpException(
+          payload ?? primaryResult.error?.message ?? "Unknown error",
+          status
+        );
+      } else {
+        // keine duffelErrors -> generischer Fehler
+        throw new HttpException(
+          payload ?? primaryResult.error?.message ?? "Unknown error",
+          status
+        );
+      }
     }
 
-    if (!o?.id) {
-      throw new BadRequestException("Duffel did not return an order");
-    }
+    // --- 6) finalOrder sollte jetzt gesetzt sein ---
+    const o = finalOrder;
+    const idem = finalIdempotencyKey as string;
 
-    // --- 7) Status/Type bestimmen ---
     const awaitingPayment = o?.payment_status?.awaiting_payment === true;
     const alreadyPaidAt = o?.payment_status?.paid_at ?? null;
 
-    const inferredType: "instant" | "hold" = "hold"; // wir erzwingen hold
+    const inferredType: "instant" | "hold" =
+      o?.type === "instant" || o?.type === "hold" ? o.type : primaryOrderType;
+
     const resolvedStatus = this.resolveStatusFromDuffel(o);
 
-    // --- 8) DB upsert ---
-    // WICHTIG:
-    // - amount/currency = was der KUNDE zahlt (pricing.total)
-    // - Duffel-Total bleibt in o.total_amount / o.total_currency (für Info/Settlement)
+    // --- 7) DB upsert ---
     const dbData = {
       duffelId: String(o.id),
       offerId: String(o.offer_id ?? dto.offerId ?? "unknown"),
@@ -441,7 +886,7 @@ export class OrdersService {
       // kein Throw – Order existiert bei Duffel auf jeden Fall
     }
 
-    // --- 9) eTicket-Poller (idempotent enqueue) ---
+    // --- 8) eTicket-Poller (idempotent enqueue) ---
     try {
       await this.eticketQueue.add(
         "poll",
@@ -459,11 +904,11 @@ export class OrdersService {
       );
     }
 
-    // --- 10) Antwort an Frontend ---
+    // --- 9) Antwort an Frontend ---
     return {
       order_id: o.id,
       status: resolvedStatus ?? "unknown",
-      order_type: inferredType, // "hold"
+      order_type: inferredType, // "instant" oder "hold"
       awaiting_payment: awaitingPayment,
       paid_at: alreadyPaidAt ?? null,
       duffel_total_amount: String(o.total_amount ?? "0"), // Airline-Betrag (für Info)

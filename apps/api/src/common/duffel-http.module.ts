@@ -29,7 +29,7 @@ import { ConfigService } from "@nestjs/config";
             "Duffel-Version": version,
             "Content-Type": "application/json",
           },
-          timeout: 15000,
+          timeout: 130000,
           maxRedirects: 3,
         };
       },
