@@ -161,6 +161,74 @@ export class PaymentsService {
     return piOrId;
   }
 
+  /**
+   * Prüft, ob ein Stripe PaymentIntent bereits bezahlt ist
+   * und ob Betrag & Währung zur erwarteten Summe passen.
+   *
+   * Gedacht für "Stripe-first"-Flows: Kunde bezahlt zuerst,
+   * dann wird erst der Duffel-Order erzeugt.
+   */
+  async verifyPrepaidIntent(
+    piId: string,
+    expectedAmount: string,
+    expectedCurrency: string
+  ) {
+    const pi = await this.getPaymentIntent(piId);
+    if (!pi) {
+      return this.resultFail("pi_not_found", `PaymentIntent ${piId} not found`);
+    }
+
+    if (pi.status !== "succeeded") {
+      return this.resultFail(
+        "pi_not_succeeded",
+        `PaymentIntent status is ${pi.status}, expected 'succeeded'`,
+        { status: pi.status }
+      );
+    }
+
+    const piCurrency = (pi.currency || "").toUpperCase();
+    const expCurrency = expectedCurrency.toUpperCase();
+
+    if (piCurrency !== expCurrency) {
+      return this.resultFail(
+        "currency_mismatch",
+        "PaymentIntent currency does not match expected currency",
+        {
+          expected: expCurrency,
+          actual: piCurrency,
+        }
+      );
+    }
+
+    // bevorzugt amount_received, fallback amount
+    const receivedMinor = pi.amount_received ?? pi.amount;
+    const receivedMajor = fromMinorUnits(receivedMinor, pi.currency); // "123.45"
+
+    const sameAmount = this.amountsEqual(
+      expectedAmount,
+      receivedMajor,
+      expCurrency
+    );
+
+    if (!sameAmount) {
+      return this.resultFail(
+        "amount_mismatch",
+        "PaymentIntent amount does not match expected amount",
+        {
+          expected: expectedAmount,
+          actual: receivedMajor,
+          currency: expCurrency,
+        }
+      );
+    }
+
+    return this.resultOk({
+      intent: pi,
+      amount: receivedMajor,
+      currency: expCurrency,
+    });
+  }
+
   // ------- Create PI (frei) -------
   async createIntent(input: {
     amount: string;

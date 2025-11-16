@@ -1,9 +1,15 @@
 // apps/api/src/flights/flights.service.ts
 import { HttpService } from "@nestjs/axios";
-import { Injectable, HttpException, BadRequestException } from "@nestjs/common";
+import {
+  Injectable,
+  HttpException,
+  BadRequestException,
+  Logger,
+} from "@nestjs/common";
 import { firstValueFrom } from "rxjs";
 import { CreateOfferRequestDto } from "./dto/create-offer-request.dto";
 import { SearchFlightsDto } from "./dto/search-flights.dto";
+import { OfferSummaryDto } from "./dto/offer-summary.dto";
 const DEFAULT_SUPPLIER_TIMEOUT_MS = Number(
   process.env.SUPPLIER_TIMEOUT_MS ?? 30000
 );
@@ -16,6 +22,9 @@ type FilterMode =
   | "any";
 @Injectable()
 export class FlightsService {
+  private readonly apiBaseUrl =
+    process.env.API_BASE_URL ?? "http://localhost:3000";
+  private readonly logger = new Logger(FlightsService.name);
   constructor(private readonly http: HttpService) {}
 
   private resolveSupplierTimeoutMs(ms?: number) {
@@ -850,6 +859,164 @@ export class FlightsService {
     return {
       offer: baseOffer,
       fares,
+    };
+  }
+
+  private async callOfferRequestsFromSearch(
+    dto: SearchFlightsDto
+  ): Promise<any[]> {
+    const slices = this.buildSlices(dto);
+    const passengers = this.makePassengers(dto);
+
+    const body: any = {
+      data: {
+        slices,
+        passengers,
+      },
+    };
+
+    // Cabin-Class
+    if (dto.cabinClass) {
+      body.data.cabin_class = dto.cabinClass;
+    }
+
+    // Advanced-Einstellungen (maxConnections, allowCarriers, blockCarriers, departTimeOfDay)
+    this.applyAdvancedToBody(body, dto);
+
+    const timeoutMs = this.resolveSupplierTimeoutMs(
+      Number(process.env.SUPPLIER_TIMEOUT_MS ?? 30000)
+    );
+
+    const { data } = await firstValueFrom(
+      this.http.post("/offer_requests", body, {
+        params: {
+          return_offers: true,
+          supplier_timeout: timeoutMs,
+        },
+        timeout: timeoutMs + 5000,
+      })
+    );
+
+    const payload = data?.data ?? data;
+
+    const offers: any[] =
+      (Array.isArray(payload?.offers) && payload.offers) ||
+      (Array.isArray(payload?.data) && payload.data) ||
+      (Array.isArray(payload) ? payload : []);
+
+    return offers;
+  }
+
+  /**
+   * Nimmt ein Array von Offers und baut daraus die 3 billigsten mit expires_at/expired.
+   */
+  private pickTop3WithExpiry(offers: any[]): any[] {
+    if (!offers.length) return [];
+
+    // nach total_amount sortieren (billigste zuerst)
+    const sorted = [...offers].sort((a, b) => {
+      const aStr = a.total_amount ?? a.totalAmount ?? "0";
+      const bStr = b.total_amount ?? b.totalAmount ?? "0";
+      const aNum = parseFloat(aStr);
+      const bNum = parseFloat(bStr);
+      return aNum - bNum;
+    });
+
+    const top3 = sorted.slice(0, 3);
+    const now = new Date();
+
+    return top3.map((o) => {
+      const expiresRaw = o.expires_at ?? o.expiresAt ?? o.valid_until ?? null;
+      const expDate = expiresRaw ? new Date(expiresRaw) : null;
+      const expired = expDate ? expDate.getTime() <= now.getTime() : false;
+
+      return {
+        ...o,
+        expires_at: expiresRaw ?? null,
+        expired,
+      };
+    });
+  }
+
+  /** Mapped ein Duffel-Offer auf eine kompakte Zusammenfassung (Preis + Expiry) */
+  private toOfferSummary(o: any): OfferSummaryDto {
+    const pr = o?.payment_requirements ?? {};
+    const requiresInstant = pr?.requires_instant_payment === true;
+    const paymentRequiredBy: string | null = pr?.payment_required_by ?? null;
+
+    const rawExpires: string | null =
+      (o.expires_at as string | null) ??
+      (o.expiresAt as string | null) ??
+      (o.valid_until as string | null) ??
+      null;
+
+    let expiresLocal: string | null = null;
+    let expiresInMinutes: number | null = null;
+
+    if (rawExpires) {
+      const d = new Date(rawExpires); // UTC
+
+      // 1) schöne lokale Darstellung (Berlin)
+      expiresLocal = d.toLocaleString("de-DE", {
+        timeZone: "Europe/Berlin",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+
+      // 2) „in x Minuten“ ab jetzt
+      const now = new Date();
+      const diffMs = d.getTime() - now.getTime();
+      expiresInMinutes = Math.floor(diffMs / 60000); // negative Werte möglich, wenn schon abgelaufen
+    }
+
+    const summary = new OfferSummaryDto();
+    summary.id = String(o.id ?? "");
+    summary.total_amount = String(o.total_amount ?? o.totalAmount ?? "0");
+    summary.total_currency = String(
+      o.total_currency ?? o.totalCurrency ?? "EUR"
+    );
+
+    summary.expires_at = rawExpires;
+    summary.expires_at_local = expiresLocal;
+    summary.expires_in_minutes = expiresInMinutes;
+
+    summary.payment_required_by = paymentRequiredBy;
+    summary.requires_instant_payment = requiresInstant;
+    summary.is_instant = requiresInstant;
+    summary.is_hold = !requiresInstant && !!paymentRequiredBy;
+
+    return summary;
+  }
+
+  async getTop3FreshOffers(dto: SearchFlightsDto) {
+    // 1. Versuch
+    const offers1 = await this.callOfferRequestsFromSearch(dto);
+    const top1 = this.pickTop3WithExpiry(offers1);
+
+    const anyExpired1 = top1.some((o) => o.expired);
+
+    if (!anyExpired1) {
+      return {
+        attempt: 1,
+        offers: top1.map((o) => this.toOfferSummary(o)),
+      };
+    }
+
+    this.logger.warn(
+      `getTop3FreshOffers: mindestens ein Offer expired beim ersten Versuch – neuer Duffel offer_requests Call`
+    );
+
+    // 2. Versuch
+    const offers2 = await this.callOfferRequestsFromSearch(dto);
+    const top2 = this.pickTop3WithExpiry(offers2);
+
+    return {
+      attempt: 2,
+      offers: top2.map((o) => this.toOfferSummary(o)),
     };
   }
 }

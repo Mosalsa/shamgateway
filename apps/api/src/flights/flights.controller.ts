@@ -165,4 +165,9 @@ export class FlightsController {
     // sonst wie bisher: nur rohes Duffel-Offer
     return this.flights.getOffer(id);
   }
+
+  @Post("test-offers")
+  async testTop3Offers(@Body() body: any) {
+    return this.flights.getTop3FreshOffers(body);
+  }
 }
